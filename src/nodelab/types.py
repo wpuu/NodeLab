@@ -1,26 +1,32 @@
-"""Typed data models for parsed proxy nodes."""
+"""Private parsed-node data and fixed, non-reflective public metadata."""
 
 from __future__ import annotations
 
-import dataclasses
 from dataclasses import dataclass, field
-from typing import Any, Optional
+from typing import Any
+
+_PARSE_CODES = frozenset({
+    "INVALID_URI", "INVALID_HOST", "INVALID_PORT", "INVALID_SECRET",
+    "INVALID_QUERY", "LINE_TOO_LONG", "UNSUPPORTED_PROTOCOL",
+})
 
 
 class NodeURIParseError(ValueError):
-    """Raised when a URI cannot be parsed into a known node shape."""
+    """Parse failure with a fixed code only: never carry a URI or exception text."""
 
-
-def _redacted_secret() -> str:
-    return "***"
+    def __init__(self, code: str = "INVALID_URI") -> None:
+        self.code = code if type(code) is str and code in _PARSE_CODES else "INVALID_URI"
+        super().__init__(self.code)
 
 
 @dataclass
 class ParsedNode:
-    """One parsed vless:// or trojan:// node.
+    """Private node; do not serialize it automatically or send it to a logger.
 
-    The secret (UUID for VLESS, password for Trojan) is kept in `secret`
-    only. All repr-style output via `public_dict()` and str() is redacted.
+    Fragment, hostname, path, query values and even a 'redacted URI' may
+    contain arbitrary credentials.  Only public_dict() may cross the public
+    boundary; the model remains private even when repr() is called by a test.
+    F2 will replace the legacy protocol fields with a strictly typed model.
     """
 
     protocol: str
@@ -38,13 +44,9 @@ class ParsedNode:
     path_features: list[str] = field(default_factory=list)
     extra_query: dict[str, str] = field(default_factory=dict)
     secret: str = ""
-    raw_uri_public: str = ""
 
     def __repr__(self) -> str:
-        masked = "***" if self.secret else ""
-        safe = dataclasses.replace(self, secret=masked)
-        parts = [f"{f.name}={getattr(safe, f.name)!r}" for f in dataclasses.fields(self)]
-        return f"{'.'.join((self.__class__.__module__, self.__class__.__qualname__)).split('.')[-1]}({', '.join(parts)})"
+        return "ParsedNode(<private>)"
 
     def __str__(self) -> str:
         return self.__repr__()
@@ -54,7 +56,11 @@ class ParsedNode:
         return "uuid" if self.protocol == "vless" else "password"
 
     def public_dict(self) -> dict[str, Any]:
-        """Field dict safe to log / serialize. Secret is never included."""
-        out = dataclasses.asdict(self)
-        out.pop("secret", None)
-        return out
+        """Build from a fixed allowlist, never from dataclasses.asdict()."""
+        return {
+            "schema_version": 1,
+            "protocol": self.protocol if type(self.protocol) is str and self.protocol in {"vless", "trojan"} else None,
+            "transport": self.transport if type(self.transport) is str and self.transport in {"tcp", "ws", "grpc"} else None,
+            # The old boolean cannot distinguish ordinary TLS from Reality.
+            "tls_mode": None,
+        }

@@ -1,41 +1,95 @@
-"""Redaction helpers: build public-safe views of parsed nodes and probe results."""
+"""Public output is an allowlist of validated scalars, never scrubbed input."""
 
 from __future__ import annotations
 
-import re
+from collections.abc import Mapping
 from typing import Any
 
 from nodelab.types import ParsedNode
 
-_UUID_RE = re.compile(
-    r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
-)
-_SECRET_QUERY_RE = re.compile(r"((?:uuid|password)=)([^&\s#]+)", re.IGNORECASE)
-_USERINFO_SECRET_RE = re.compile(r"^(?:[a-z0-9+.\-]+://)([^@/]+@)", re.IGNORECASE)
+_STATUS = frozenset({"PASS", "FAIL", "PARTIAL", "CONFLICT", "UNSUPPORTED"})
+_STAGE = frozenset({
+    "INPUT", "PARSE", "CONFIG", "BINARY", "STARTUP", "CONTROLLER",
+    "ROUTE", "EXIT_A", "EXIT_B", "CLEANUP",
+})
+_PROTOCOL = frozenset({"vless", "trojan"})
+_TRANSPORT = frozenset({"tcp", "ws", "grpc"})
+_TLS_MODE = frozenset({"tls", "reality"})
+_ERROR_CODE = frozenset({
+    "INVALID_ARGUMENTS", "URI_ARGV_FORBIDDEN", "INPUT_FILE_UNSAFE", "INPUT_TOO_LARGE",
+    "INVALID_UTF8", "INVALID_URI", "INVALID_HOST", "INVALID_PORT",
+    "INVALID_SECRET", "INVALID_QUERY", "LINE_TOO_LONG", "UNSUPPORTED_PROTOCOL",
+    "PROBE_GATE_CLOSED", "ROUTE_PROOF_UNAVAILABLE", "ROUTE_DIRECT",
+    "RUNTIME_MISMATCH", "PROBE_DEADLINE", "CONFIG_TEST_FAILED",
+    "CONFIG_TEST_TIMEOUT", "CONFIG_BUILD_FAILED", "BINARY_MISMATCH",
+    "PROCESS_START_FAILED", "PROCESS_STOP_FAILED", "PRIVATE_DIR_UNSAFE",
+    "SECRET_CLEANUP_FAILED", "RECOVERY_REVIEW_REQUIRED",
+    "UNSUPPORTED_INSECURE_NOT_APPROVED", "PUBLIC_SCHEMA_REJECTED",
+})
 
 
-def redact_value(value: Any) -> Any:
-    """Recursively replace UUIDs and secret query values in a value tree."""
-    if isinstance(value, dict):
-        return {k: redact_value(v) for k, v in value.items()}
-    if isinstance(value, (list, tuple)):
-        return [redact_value(v) for v in value]
-    if isinstance(value, str):
-        s = _UUID_RE.sub("***", value)
-        s = _SECRET_QUERY_RE.sub(r"\1***", s)
-        return s
-    return value
+def _enum(value: Any, allowed: frozenset[str]) -> str | None:
+    return value if type(value) is str and value in allowed else None
+
+
+def _boolean(value: Any) -> bool | None:
+    return value if type(value) is bool else None
+
+
+def _number(value: Any, *, lower: int, upper: int) -> int | None:
+    return value if type(value) is int and lower <= value <= upper else None
 
 
 def redacted_node_dict(node: ParsedNode) -> dict[str, Any]:
-    """Public dict for one node: secrets absent, redacted_uri attached."""
-    d = node.public_dict()
-    d["redacted_uri"] = node.raw_uri_public
-    return redact_value(d)
+    """Minimal, fixed public view; no URI, fragment or arbitrary metadata."""
+    return redacted_result_dict(node.public_dict())
 
 
-def redacted_result_dict(result: dict[str, Any]) -> dict[str, Any]:
-    """Public dict for a probe result (secrets scrubbed everywhere)."""
-    scrubbed = redact_value(result)
-    scrubbed.pop("secret", None)
-    return scrubbed
+def redacted_result_dict(result: Any) -> dict[str, Any] | list[dict[str, Any]]:
+    """Reconstruct a public dict/list without copying unknown keys/strings.
+
+    Anything that fails validation is replaced with a fixed value or null;
+    attacker-controlled strings never enter even an error field.  This is
+    also the serializer for CLI, exceptions and eventual result persistence.
+    """
+    if isinstance(result, (list, tuple)):
+        return [redacted_result_dict(item) for item in result]
+    if isinstance(result, ParsedNode):
+        result = result.public_dict()
+    if not isinstance(result, Mapping):
+        result = {"probe_status": "FAIL", "stage": "INPUT", "error_code": "PUBLIC_SCHEMA_REJECTED"}
+
+    code = result.get("error_code")
+    if code is not None and _enum(code, _ERROR_CODE) is None:
+        code = "PUBLIC_SCHEMA_REJECTED"
+    status = _enum(result.get("probe_status"), _STATUS)
+    # F1 has NO trusted route-evidence producer. Even a caller-constructed
+    # result with route_verified=True must not publish a positive verdict.
+    gated = status in {"PASS", "PARTIAL", "CONFLICT"}
+    if gated:
+        status, code = "FAIL", "ROUTE_PROOF_UNAVAILABLE"
+
+    return {
+        "schema_version": 1,
+        "line_number": _number(result.get("line_number"), lower=1, upper=1_000_000),
+        "protocol": _enum(result.get("protocol"), _PROTOCOL),
+        "transport": _enum(result.get("transport"), _TRANSPORT),
+        "tls_mode": _enum(result.get("tls_mode"), _TLS_MODE),
+        "probe_status": status,
+        "stage": "ROUTE" if gated else _enum(result.get("stage"), _STAGE),
+        "error_code": code,
+        "config_ok": _boolean(result.get("config_ok")),
+        "controller_ready": _boolean(result.get("controller_ready")),
+        "listener_ready": _boolean(result.get("listener_ready")),
+        "route_verified": False if gated else _boolean(result.get("route_verified")),
+        "source_count": 0 if gated else _number(result.get("source_count"), lower=0, upper=2),
+        "sources_agree": None if gated else _boolean(result.get("sources_agree")),
+        "latency_ms": _number(result.get("latency_ms"), lower=0, upper=120_000),
+    }
+
+
+def redact_value(value: Any) -> Any:
+    """Legacy entry point: never attempt best-effort regexp sanitization."""
+    if isinstance(value, (Mapping, ParsedNode, list, tuple)):
+        return redacted_result_dict(value)
+    return None

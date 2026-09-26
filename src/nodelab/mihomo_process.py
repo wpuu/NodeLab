@@ -1,138 +1,78 @@
-"""Mihomo subprocess lifecycle: locate binary, test config, start/stop.
+"""F1 exact-child lifecycle; real engine launching waits for F2/F3.
 
-All error text goes through redact_uri() so no credential ever reaches
-a log or exception message.
+No global process enumeration or termination is permitted. The owner of a
+Popen object may terminate only that Popen, with a bounded wait and a fixed
+error code. The private RunContext owns configuration removal separately.
 """
 
 from __future__ import annotations
 
-import shutil
 import subprocess
-import sys
-import time
 from pathlib import Path
 
-from nodelab.parser import redact_uri
 
-TOOLS_DIR = Path(__file__).resolve().parents[3] / "tools" / "mihomo"
-_CREATE_NO_WINDOW = 0x08000000
+class ProcessLifecycleError(RuntimeError):
+    def __init__(self) -> None:
+        super().__init__("PROCESS_STOP_FAILED")
 
 
 def find_mihomo_exe() -> Path | None:
-    candidate = TOOLS_DIR / "mihomo.exe"
-    if candidate.exists():
-        return candidate
-    found = shutil.which("mihomo.exe")
-    return Path(found) if found else None
+    """Do not select PATH/unverified executables until F2's pinned verifier."""
+    return None
 
 
 def run_version_check(exe: Path) -> tuple[bool, str]:
-    try:
-        r = subprocess.run(
-            [str(exe), "-v"],
-            capture_output=True,
-            text=True,
-            timeout=15,
-        )
-        out = (r.stdout or r.stderr or "").strip()
-        return r.returncode == 0, out
-    except Exception as exc:  # noqa: BLE001
-        return False, f"version check failed: {redact_uri(str(exc))}"
+    """No unverified binary execution or raw stdout in F1."""
+    return False, "BINARY_MISMATCH"
 
 
 def test_config(exe: Path, config_path: Path) -> tuple[bool, str]:
-    """Run `mihomo -t -f config`; return (ok, redacted_error)."""
+    """Disabled until F2 implements the pinned binary/config path contract."""
+    return False, "PROBE_GATE_CLOSED"
+
+
+def stop_owned_process(proc: subprocess.Popen) -> None:
+    """Terminate ONLY the supplied Popen; never use process names/PID scans."""
     try:
-        r = subprocess.run(
-            [str(exe), "-t", "-f", str(config_path)],
-            capture_output=True,
-            text=True,
-            timeout=30,
-        )
-        if r.returncode == 0:
-            return True, ""
-        err = ((r.stderr or "") + " " + (r.stdout or "")).strip()
-        return False, redact_uri(err)
-    except subprocess.TimeoutExpired:
-        return False, "config test timed out"
-    except Exception as exc:  # noqa: BLE001
-        return False, f"config test failed: {redact_uri(str(exc))}"
+        if proc.poll() is None:
+            proc.terminate()
+        try:
+            proc.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            if proc.poll() is None:
+                proc.kill()
+            proc.wait(timeout=2)
+        if proc.poll() is None:
+            raise ProcessLifecycleError()
+    except BaseException:
+        # Cancellation during cleanup must not leave our own child alive.
+        try:
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait(timeout=2)
+            if proc.poll() is not None:
+                return  # recovered: the owned child is confirmed gone
+        except BaseException:
+            pass
+        raise ProcessLifecycleError() from None
 
 
 class MihomoProcess:
-    """Wrapper around a started mihomo.exe; close() must always be called."""
+    """Ownership wrapper for one exact subprocess.Popen, never a name/PID scan."""
 
-    def __init__(self, proc: subprocess.Popen, exe: Path, config_path: Path):
+    def __init__(self, proc: subprocess.Popen):
+        if not isinstance(proc, subprocess.Popen):
+            raise ProcessLifecycleError()
         self.proc = proc
-        self.exe = exe
-        self.config_path = config_path
         self.closed = False
 
     @classmethod
     def start(cls, exe: Path, config_path: Path, wait_seconds: float = 8.0) -> "MihomoProcess":
-        ok, err = test_config(exe, config_path)
-        if not ok:
-            raise RuntimeError(f"mihomo config test failed: {err}")
-
-        creationflags = _CREATE_NO_WINDOW if sys.platform == "win32" else 0
-        proc = subprocess.Popen(
-            [str(exe), "-d", str(config_path.parent), "-f", str(config_path)],
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            creationflags=creationflags,
-        )
-        deadline = time.time() + wait_seconds
-        while time.time() < deadline:
-            if proc.poll() is not None:
-                raise RuntimeError("mihomo exited early after start")
-            time.sleep(0.2)
-        return cls(proc, exe, config_path)
+        # F1 disallows launching the broken/unverified business configuration.
+        raise RuntimeError("PROBE_GATE_CLOSED")
 
     def close(self) -> None:
         if self.closed:
             return
+        stop_owned_process(self.proc)
         self.closed = True
-        if self.proc.poll() is None:
-            self.proc.terminate()
-            try:
-                self.proc.wait(timeout=10)
-            except subprocess.TimeoutExpired:
-                self.proc.kill()
-                try:
-                    self.proc.wait(timeout=5)
-                except subprocess.TimeoutExpired:
-                    pass
-        shutil.rmtree(self.config_path.parent, ignore_errors=True)
-
-
-def list_mihomo_pids() -> list[str]:
-    """Return PIDs of running mihomo.exe processes (best effort, no-throw)."""
-    try:
-        output = subprocess.run(
-            ["wmic", "process", "where", "name='mihomo.exe'", "get", "ProcessId", "/value"],
-            capture_output=True,
-            text=True,
-            timeout=20,
-        ).stdout
-        pids = [line.split("=")[1].strip() for line in output.splitlines() if "=" in line]
-        return pids
-    except Exception:  # noqa: BLE001
-        return []
-
-
-def cleanup_stale_mihomo() -> int:
-    """Terminate leftover mihomo.exe processes; returns how many we killed."""
-    import ctypes
-
-    killed = 0
-    for pid in list_mihomo_pids():
-        try:
-            handle = ctypes.windll.kernel32.OpenProcess(0x0001, False, int(pid))  # PROCESS_TERMINATE
-            if handle:
-                ctypes.windll.kernel32.TerminateProcess(handle, 1)
-                ctypes.windll.kernel32.CloseHandle(handle)
-                killed += 1
-        except Exception:  # noqa: BLE001
-            pass
-    return killed

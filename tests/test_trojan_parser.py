@@ -1,62 +1,58 @@
-"""Unit tests: Trojan parser (fictional credentials only)."""
+"""Legacy parser sanity only; F2 will implement strict protocol dialects."""
+
+import secrets
+from urllib.parse import quote
 
 import pytest
 
-from nodelab.parser import parse_uri, redact_uri
-from nodelab.types import NodeURIParseError
-
-TROJAN_WS = (
-    "trojan://s3cr3t-p4ssw0rd@203.0.113.20:443"
-    "?type=ws&security=tls&path=%2Ftrojan-ws&host=203.0.113.20&fp=chrome"
-    "#TROJAN-ws-02"
-)
+from nodelab.parser import parse_uri, parse_uris, redact_uri
 
 
-def test_trojan_ws_tls_fields():
-    node = parse_uri(TROJAN_WS)
-    assert node.protocol == "trojan"
-    assert node.entry_host == "203.0.113.20"
-    assert node.entry_port == 443
-    assert node.transport == "ws"
-    assert node.tls is True
-    assert node.sni == "203.0.113.20"
-    assert node.host_header == "203.0.113.20"
-    assert node.path == "/trojan-ws"
-    assert node.display_name == "TROJAN-ws-02"
-    assert node.secret == "s3cr3t-p4ssw0rd"
+@pytest.fixture
+def trojan_ws():
+    password = "FAKE_ONLY_" + secrets.token_urlsafe(25)
+    uri = (f"trojan://{quote(password)}@203.0.113.20:443"
+           "?type=ws&security=tls&path=%2Ftrojan-ws&host=203.0.113.20&fp=chrome"
+           "#TROJAN-ws-fixture")
+    return uri, password
 
 
-def test_trojan_public_dict_has_no_password():
-    node = parse_uri(TROJAN_WS)
-    d = node.public_dict()
-    assert "secret" not in d
-    assert "s3cr3t-p4ssw0rd" not in str(d)
-    assert "s3cr3t-p4ssw0rd" not in repr(node)
-
-
-def test_trojan_redact_uri_blanks_password():
-    r = redact_uri(TROJAN_WS)
-    assert "s3cr3t-p4ssw0rd" not in r
-    assert "***" in r
-
-
-def test_trojan_chinese_fragment_and_host():
-    uri = (
-        "trojan://another%2Bpw@198.51.100.33:8443"
-        "?type=ws&security=tls&host=example.com&sni=example.com"
-        "#%E8%AE%A8%E8%AE%AE%E5%8D%95%E8%8A%82%E7%82%B9"
-    )
+def test_trojan_ws_fields_are_private(trojan_ws):
+    uri, password = trojan_ws
     node = parse_uri(uri)
-    assert node.display_name == "讨议单节点"
-    assert node.sni == "example.com"
-    assert node.host_header == "example.com"
-    assert node.secret == "another+pw"
+    assert (node.protocol, node.entry_host, node.entry_port) == ("trojan", "203.0.113.20", 443)
+    assert node.transport == "ws" and node.tls is True
+    assert node.sni == "203.0.113.20" and node.host_header == "203.0.113.20"
+    assert node.path == "/trojan-ws" and node.secret == password
+    assert node.display_name == "TROJAN-ws-fixture"
 
 
-def test_trojan_unparseable_line_in_batch():
-    from nodelab.parser import parse_uris
+def test_trojan_public_dict_has_no_password(trojan_ws):
+    uri, password = trojan_ws
+    node = parse_uri(uri)
+    assert password not in str(node.public_dict())
+    assert password not in repr(node) and password not in str(node)
+    assert "entry_host" not in node.public_dict()
 
-    text = f"{TROJAN_WS}\ngarbage-line\n"
-    out = parse_uris(text)
-    assert out[0] is not None
-    assert out[1] is None
+
+def test_trojan_redacted_uri_never_contains_the_original(trojan_ws):
+    uri, password = trojan_ws
+    result = redact_uri(uri)
+    assert result == "[URI_REDACTED]" and password not in result
+
+
+def test_trojan_unicode_fragment_and_encoded_password():
+    password = "FAKE_ONLY_" + secrets.token_urlsafe(25) + "+@:"
+    uri = (f"trojan://{quote(password, safe='')}@198.51.100.33:8443"
+           "?type=ws&security=tls&host=example.invalid&sni=example.invalid"
+           "#%E8%AE%A8%E8%AE%AE%E5%8D%95%E8%8A%82%E7%82%B9")
+    node = parse_uri(uri)
+    assert node.secret == password and node.display_name == "讨议单节点"
+    assert node.sni == "example.invalid" and node.host_header == "example.invalid"
+
+
+def test_trojan_bad_line_does_not_echo_password(trojan_ws):
+    uri, password = trojan_ws
+    out = parse_uris(uri + "\ngarbage-line\n")
+    assert out[0] is not None and out[1] is None
+    assert password not in repr(out)

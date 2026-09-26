@@ -1,14 +1,12 @@
-"""URI parsing for vless:// and trojan://.
+"""Legacy URI parser isolated behind the F1 probe gate.
 
-Secrets (VLESS UUID, Trojan password) are kept in memory on ParsedNode.secret
-and are never included in public_dict(), redacted URIs, or error messages.
+F2 will define the strict, lossless VLESS/Trojan dialect.  Until then no
+parsed value may cause a network probe, and no original URI is displayable.
 """
 
 from __future__ import annotations
 
-import re
 import urllib.parse
-from typing import Optional
 
 from nodelab.types import NodeURIParseError, ParsedNode
 
@@ -17,14 +15,11 @@ _SECRET_QUERY_KEYS = {"uuid", "password"}
 
 
 def _is_valid_uuid(value: str) -> bool:
-    v = value.strip().lower()
-    if len(v) != 36 or v.count("-") != 4:
-        return False
+    v = value.lower()
     parts = v.split("-")
-    sizes = [8, 4, 4, 4, 12]
     if len(parts) != 5:
         return False
-    for size, part in zip(sizes, parts):
+    for size, part in zip((8, 4, 4, 4, 12), parts):
         if len(part) != size:
             return False
         try:
@@ -35,90 +30,82 @@ def _is_valid_uuid(value: str) -> bool:
 
 
 def _flag_path_features(node: ParsedNode) -> None:
-    # Only a flag, not a claim: proxyip in path/query is evidence of a
-    # multi-hop setup but NL-002 must not assert hop counts from strings.
+    # A private hint, not a hop-count assertion or public metadata.
     if "proxyip=" in node.path or any(f"{k}=" in node.path for k in node.extra_query):
-        if "contains_proxyip_list" not in node.path_features:
-            node.path_features.append("contains_proxyip_list")
+        node.path_features.append("contains_proxyip_list")
 
 
 def parse_uri(uri: str) -> ParsedNode:
-    """Parse a vless:// or trojan:// URI into a ParsedNode.
+    """Parse a single line into a *private* node, never into probe authority.
 
-    Raises NodeURIParseError (redacted text, no raw secret) on failure.
+    Raises only fixed-code NodeURIParseError; no untrusted exception message
+    is chained into a public result.  This is not F2 dialect validation.
     """
-    if not isinstance(uri, str) or not uri.strip():
-        raise NodeURIParseError("empty or non-string URI")
-    raw = uri.strip()
+    if not isinstance(uri, str) or not uri or uri != uri.strip() or any(c in uri for c in "\r\n\x00"):
+        raise NodeURIParseError("INVALID_URI")
+    try:
+        size = len(uri.encode("utf-8", errors="strict"))
+    except UnicodeError:
+        raise NodeURIParseError("INVALID_URI") from None
+    if size > 8192:
+        raise NodeURIParseError("LINE_TOO_LONG")
+    if not uri.lower().startswith(_SUPPORTED):
+        raise NodeURIParseError("UNSUPPORTED_PROTOCOL")
 
-    if not any(raw.lower().startswith(s) for s in _SUPPORTED):
-        raise NodeURIParseError(
-            "unsupported protocol; NL-002 supports vless:// and trojan://"
+    try:
+        head, _, fragment = uri.partition("#")
+        parsed = urllib.parse.urlparse(head)
+        protocol = parsed.scheme.lower()
+        if parsed.netloc.count("@") != 1:
+            raise NodeURIParseError("INVALID_SECRET")
+        userinfo, _hostport = parsed.netloc.split("@", 1)
+        # Trojan passwords include literal ':'; an '@' in a password must
+        # be percent-encoded. VLESS secrets remain UUIDs only.
+        secret = urllib.parse.unquote(userinfo, encoding="utf-8", errors="strict")
+        if not secret or any(ord(c) < 32 or ord(c) == 127 for c in secret):
+            raise NodeURIParseError("INVALID_SECRET")
+
+        host = parsed.hostname or ""
+        port = parsed.port
+        if port is None or not (0 < port <= 65535):
+            raise NodeURIParseError("INVALID_PORT")
+        if not host:
+            raise NodeURIParseError("INVALID_HOST")
+
+        pairs = urllib.parse.parse_qsl(
+            parsed.query, keep_blank_values=True, encoding="utf-8", errors="strict", max_num_fields=100,
         )
+        query: dict[str, str] = {}
+        for key, value in pairs:
+            query.setdefault(key, value)
+        display_name = urllib.parse.unquote(fragment, encoding="utf-8", errors="strict") if fragment else ""
 
-    head, _, frag = raw.partition("#")
-    parsed = urllib.parse.urlparse(head)
-
-    protocol = parsed.scheme.lower()
-    userinfo = parsed.netloc.split("@", 1)[0] if "@" in parsed.netloc else ""
-    secret = urllib.parse.unquote(userinfo.split(":", 1)[0]) if userinfo else ""
-
-    host = parsed.hostname or ""
-    port = parsed.port
-    if port is None or not (0 < port <= 65535):
-        raise NodeURIParseError("missing or invalid port")
-    if not host:
-        raise NodeURIParseError("missing host")
-
-    pairs = urllib.parse.parse_qsl(parsed.query, keep_blank_values=True)
-    query: dict[str, str] = {}
-    for k, v in pairs:
-        query.setdefault(k, v)
-
-    display_name = urllib.parse.unquote(frag) if frag else ""
-
-    if protocol == "vless":
-        if not _is_valid_uuid(secret):
-            raise NodeURIParseError("invalid vless secret")
-        node = ParsedNode(
-            protocol="vless",
-            display_name=display_name,
-            entry_host=host,
-            entry_port=port,
-            secret=secret,
-        )
-    else:
-        node = ParsedNode(
-            protocol="trojan",
-            display_name=display_name,
-            entry_host=host,
-            entry_port=port,
-            secret=secret,
-        )
-
-    node.transport = query.get("type", "").lower()
-    security = query.get("security", "")
-    node.tls = security in ("tls", "real")
-
-    node.sni = query.get("sni", "") or query.get("peer", "") or host
-    node.host_header = query.get("host", "")
-    node.path = urllib.parse.unquote(query.get("path", ""))
-    node.flow = query.get("flow", "")
-    node.client_fingerprint = query.get("fp", "")
-    node.allow_insecure = query.get("allowInsecure", "").lower() in ("1", "true", "yes")
-
-    node.extra_query = {k: v for k, v in query.items() if k.lower() not in _SECRET_QUERY_KEYS}
-    node.raw_uri_public = redact_uri(raw)
-    _flag_path_features(node)
-    return node
+        if protocol == "vless" and not _is_valid_uuid(secret):
+            raise NodeURIParseError("INVALID_SECRET")
+        node = ParsedNode(protocol=protocol, display_name=display_name, entry_host=host,
+                          entry_port=port, secret=secret)
+        node.transport = query.get("type", "").lower()
+        node.tls = query.get("security", "") in ("tls", "real")
+        node.sni = query.get("sni", "") or query.get("peer", "") or host
+        node.host_header = query.get("host", "")
+        node.path = urllib.parse.unquote(query.get("path", ""), encoding="utf-8", errors="strict")
+        node.flow = query.get("flow", "")
+        node.client_fingerprint = query.get("fp", "")
+        node.allow_insecure = query.get("allowInsecure", "").lower() in ("1", "true", "yes")
+        node.extra_query = {k: v for k, v in query.items() if k.lower() not in _SECRET_QUERY_KEYS}
+        _flag_path_features(node)
+        return node
+    except NodeURIParseError:
+        raise
+    except (ValueError, UnicodeError, OverflowError):
+        raise NodeURIParseError("INVALID_URI") from None
 
 
-def parse_uris(text: str) -> list[Optional[ParsedNode]]:
-    """Parse newline-separated URIs; None marks an unparseable line."""
-    out: list[Optional[ParsedNode]] = []
+def parse_uris(text: str) -> list[ParsedNode | None]:
+    """Compatibility helper; strict per-line input and statuses arrive in F2."""
+    out: list[ParsedNode | None] = []
     for line in text.splitlines():
-        line = line.strip()
-        if not line:
+        if not line.strip():
             continue
         try:
             out.append(parse_uri(line))
@@ -128,24 +115,5 @@ def parse_uris(text: str) -> list[Optional[ParsedNode]]:
 
 
 def redact_uri(uri: str) -> str:
-    """Return the URI with its credential replaced by ***.
-
-    Works on parseable URIs (blank the userinfo secret, uuid=, password=)
-    and on unparseable ones (best-effort blank of uuid=/password= values).
-    Never echoes the secret.
-    """
-    raw = (uri or "").strip()
-    if not raw:
-        return raw
-
-    known = raw.lower().startswith(_SUPPORTED)
-    if known:
-        prefix_end = raw.index("://") + 3
-        remainder = raw[prefix_end:]
-        at = remainder.find("@")
-        secret = remainder[:at] if at != -1 else ""
-        if secret:
-            raw = raw[:prefix_end] + "***" + remainder[at:]
-    raw = re.sub(r"(uuid=)([^&\s#]+)", r"\1***", raw)
-    raw = re.sub(r"(password=)([^&\s#]+)", r"\1***", raw)
-    return raw
+    """Legacy API: an arbitrary URI is *never* safe to show, even masked."""
+    return "[URI_REDACTED]"

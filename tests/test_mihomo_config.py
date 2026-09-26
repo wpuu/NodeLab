@@ -1,50 +1,41 @@
-"""Unit tests: mihomo YAML generation + display scrub (no secrets in showable output)."""
+"""F1: old unsafe engine config is gated; YAML exists only in a private run."""
 
-import json
+import os
+import secrets
+from pathlib import Path
 
-import yaml
+import pytest
 
-from nodelab.mihomo_config import build_mihomo_yaml, scrub_yaml_for_display, write_probe_config
+from nodelab.mihomo_config import (
+    PrivateRunError, RunContext, build_mihomo_yaml, scrub_yaml_for_display,
+    write_probe_config,
+)
 from nodelab.parser import parse_uri
 
-UUID_X = "2b3c4d5e-6f7a-8b9c-0d1e-2f3a4b5c6d7e"
-PW_X = "tr0jan-secret-pw"
+
+def _node():
+    password = "FAKE_ONLY_" + secrets.token_urlsafe(25)
+    return parse_uri(f"trojan://{password}@203.0.113.50:443?security=tls"), password
 
 
-def test_yaml_contains_secret_in_temp_config():
-    node = parse_uri(f"vless://{UUID_X}@203.0.113.50:443?security=tls&type=ws&path=%2Fws&host=203.0.113.50")
-    config, _sec, _m, _c, group = write_probe_config(node)
-    text = config.read_text(encoding="utf-8")
-    cfg = yaml.safe_load(text)
-    assert group == "PROBE"
-    # secret exists in the temp YAML (required to run)
-    assert UUID_X in text
-    # but listeners are loopback-only
-    assert cfg["external-controller"].startswith("127.0.0.1:")
-    assert cfg["inbounds"][0]["listen"] == "127.0.0.1"
-    assert "0.0.0.0" not in json.dumps(cfg)
+def _context(tmp_path: Path) -> RunContext:
+    return RunContext() if os.name == "nt" else RunContext(tmp_path / "private")
 
 
-def test_display_json_has_no_secret():
-    node = parse_uri(f"vless://{UUID_X}@203.0.113.50:443?security=tls")
-    config, _sec, _m, _c, _g = write_probe_config(node)
-    text = config.read_text(encoding="utf-8")
-    scrubbed = scrub_yaml_for_display(text)
-    assert UUID_X not in scrubbed
-    assert "***" in scrubbed
-
-    # trojan variant
-    node2 = parse_uri(f"trojan://{PW_X}@203.0.113.51:443?security=tls")
-    config2, _s2, _m2, _c2, _g2 = write_probe_config(node2)
-    text2 = config2.read_text(encoding="utf-8")
-    scrubbed2 = scrub_yaml_for_display(text2)
-    assert PW_X not in scrubbed2
+def test_legacy_wrong_mihomo_config_is_not_executable():
+    node, _password = _node()
+    for old_api in (build_mihomo_yaml, write_probe_config):
+        with pytest.raises(PrivateRunError) as info:
+            old_api(node)
+        assert info.value.code == "PROBE_GATE_CLOSED"
 
 
-def test_yaml_ports_are_loopback_free():
-    node = parse_uri(f"vless://{UUID_X}@203.0.113.52:443?security=tls")
-    cfg, sec, mixed, ctrl = build_mihomo_yaml(node)
-    assert cfg["external-controller"] == f"127.0.0.1:{ctrl}"
-    assert cfg["external-controller-secret"] == sec
-    assert cfg["inbounds"][0]["port"] == mixed
-    assert cfg["inbounds"][0]["listen"] == "127.0.0.1"
+def test_private_yaml_only_during_owned_run(tmp_path: Path):
+    node, password = _node()
+    ctx = _context(tmp_path)
+    with ctx:
+        yaml_path = ctx.write_yaml({"proxies": [{"password": node.secret}]})
+        assert yaml_path.is_file()
+        assert password in yaml_path.read_text(encoding="utf-8")
+        assert password not in scrub_yaml_for_display(yaml_path.read_text(encoding="utf-8"))
+    assert ctx.closed and not yaml_path.exists() and not ctx.run_dir.exists()

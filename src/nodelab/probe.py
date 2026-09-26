@@ -1,201 +1,105 @@
-"""Real probe: start Mihomo, measure latency, verify exit IPs via two sources.
+"""F1 fail-closed probe gate and pure verdict rules; no live network probes.
 
-All output is redacted; no secret ever reaches a result dict, log, or error.
+The former code could return PASS solely because two exit-IP sites agreed,
+without proving either request went through NODE.  F3 will wire validated,
+connection-specific Mihomo evidence into this decision boundary.  Until F3
+and Windows offline acceptance, every production probe is disabled.
 """
 
 from __future__ import annotations
 
-import json
-import os
-import socket
+import ipaddress
+from dataclasses import dataclass
 from pathlib import Path
 
-import httpx
-
-from nodelab.mihomo_config import DELAY_URL, PROBE_GROUP, write_probe_config
-from nodelab.mihomo_process import MihomoProcess, find_mihomo_exe, test_config
-from nodelab.parser import redact_uri
-from nodelab.redaction import redacted_node_dict, redacted_result_dict
+from nodelab.redaction import redacted_result_dict
 from nodelab.types import ParsedNode
 
-IP_INFO_LITE_URL = "https://ipinfo.io/{ip}"
-_IPIFY = "https://api.ipify.org?format=json"
-_CF_TRACE = "https://www.cloudflare.com/cdn-cgi/trace"
+
+@dataclass(frozen=True, repr=False)
+class RouteObservation:
+    """Private evidence candidate, NOT proof until F3 verifies controller IDs.
+
+    No arbitrary string here is ever serialized to public output.
+    """
+
+    ip: str | None = None
+    route_verified: bool = False
+    tls_verified: bool = False
+    http_ok: bool = False
+    direct_seen: bool = False
+
+    def __repr__(self) -> str:
+        return "RouteObservation(<private>)"
 
 
-def resolve_entry(host: str, port: int) -> list[str]:
-    """Local DNS resolution of entry host; returns IP strings or []."""
-    if not host:
-        return []
-    try:
-        infos = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
-        ips: list[str] = []
-        for info in infos:
-            ip = info[4][0]
-            if ip not in ips:
-                ips.append(ip)
-        return ips
-    except Exception:  # noqa: BLE001
-        return []
+def decide_probe_status(
+    source_a: RouteObservation | None,
+    source_b: RouteObservation | None,
+    *,
+    runtime_verified: bool,
+    cleanup_ok: bool,
+    unsupported: bool = False,
+    hard_failure: bool = False,
+    production: bool = True,
+) -> tuple[str, str | None]:
+    """Pure fail-closed verdict; F1 product never supplies positive evidence.
 
+    Only F3's per-original-request association may assert route_verified.
+    A validated public exit IP is returned privately only after both sources
+    agree; the public serializer deliberately has no confirmed-IP field.
+    """
+    if unsupported:
+        return "UNSUPPORTED", None
+    if runtime_verified is not True or cleanup_ok is not True or hard_failure:
+        return "FAIL", None
+    if (source_a and source_a.direct_seen) or (source_b and source_b.direct_seen):
+        return "FAIL", None
 
-def _delay_via_controller(controller: str, secret: str, group: str = PROBE_GROUP) -> tuple[int | None, str | None]:
-    url = f"{controller}/proxies/{group}/delay"
-    headers = {}
-    if secret:
-        headers["Authorization"] = f"Bearer {secret}"
-    try:
-        with httpx.Client(timeout=30) as client:
-            r = client.get(url, params={"url": DELAY_URL, "timeout": 5000}, headers=headers)
-            if r.status_code != 200:
-                return None, f"delay HTTP {r.status_code}: {redact_uri(r.text[:200])}"
-            data = r.json()
-            latency = (data or {}).get("delay")
-            if latency and isinstance(latency, (int, float)) and latency > 0:
-                return int(latency), None
-            return None, "delay endpoint returned no usable value"
-    except Exception as exc:  # noqa: BLE001
-        return None, f"delay request failed: {redact_uri(str(exc))}"
+    def valid(observation: RouteObservation | None) -> ipaddress.IPv4Address | ipaddress.IPv6Address | None:
+        if (observation is None or type(observation.route_verified) is not bool
+                or not observation.route_verified or observation.tls_verified is not True
+                or observation.http_ok is not True or not isinstance(observation.ip, str)):
+            return None
+        try:
+            address = ipaddress.ip_address(observation.ip)
+            if production and not address.is_global:
+                return None
+            return address
+        except ValueError:
+            return None
 
-
-def _cloudflare_exit_ip(client: httpx.Client) -> str | None:
-    r = client.get(_CF_TRACE, timeout=30)
-    if r.status_code != 200:
-        return None
-    for line in r.text.splitlines():
-        if line.startswith("ip="):
-            return line.split("=", 1)[1].strip()
-    return None
+    first = valid(source_a)
+    second = valid(source_b)
+    if first is not None and second is not None:
+        if first.version != second.version:
+            return "PARTIAL", None
+        if first != second:
+            return "CONFLICT", None
+        return "PASS", str(first)
+    if first is not None or second is not None:
+        return "PARTIAL", None
+    return "FAIL", None
 
 
 def probe_node(node: ParsedNode) -> dict:
-    """Full probe of one node; returns a redacted result dict."""
-    base = redacted_node_dict(node)
-    base.update(
-        {
-            "resolved_entry_ips": resolve_entry(node.entry_host, node.entry_port),
-            "config_ok": False,
-            "proxy_http_ok": False,
-            "exit_ip_source_1": None,
-            "exit_ip_source_2": None,
-            "sources_agree": None,
-            "entry_exit_same": None,
-            "latency_ms": None,
-            "ipinfo_status": "SKIPPED_NO_TOKEN",
-            "country": None,
-            "country_code": None,
-            "asn": None,
-            "as_name": None,
-            "probe_status": "FAIL",
-            "error": None,
-            "errors": [],
-        }
-    )
-
-    exe = find_mihomo_exe()
-    if exe is None:
-        base["error"] = "mihomo.exe not found (run bootstrap_mihomo.ps1 first)"
-        return redacted_result_dict(base)
-
-    config_path, controller_secret, mixed_port, controller_port, group = write_probe_config(node)
-    proc: MihomoProcess | None = None
-    proxy_client: httpx.Client | None = None
-    try:
-        ok, err = test_config(exe, config_path)
-        if not ok:
-            base["error"] = f"config test failed: {err}"
-            return redacted_result_dict(base)
-        base["config_ok"] = True
-
-        proc = MihomoProcess.start(exe, config_path, wait_seconds=8)
-        controller = f"http://127.0.0.1:{controller_port}"
-        latency, latency_err = _delay_via_controller(controller, controller_secret, group)
-        if latency is not None:
-            base["latency_ms"] = latency
-        elif latency_err:
-            base["errors"].append(latency_err)
-
-        proxy_client = httpx.Client(timeout=30, proxy=f"http://127.0.0.1:{mixed_port}")
-
-        try:
-            r1 = proxy_client.get(_IPIFY, timeout=30)
-            base["exit_ip_source_1"] = r1.json().get("ip") if r1.status_code == 200 else None
-        except Exception as exc:  # noqa: BLE001
-            base["errors"].append(f"ipify: {redact_uri(str(exc))}")
-
-        try:
-            base["exit_ip_source_2"] = _cloudflare_exit_ip(proxy_client)
-        except Exception as exc:  # noqa: BLE001
-            base["errors"].append(f"cloudflare trace: {redact_uri(str(exc))}")
-
-        src1 = base["exit_ip_source_1"]
-        src2 = base["exit_ip_source_2"]
-        if src1 and src2:
-            base["sources_agree"] = src1 == src2
-            confirmed = src1
-        elif src1 or src2:
-            confirmed = src1 or src2
-        else:
-            confirmed = None
-
-        if confirmed:
-            base["proxy_http_ok"] = True
-            entry_ips = base.get("resolved_entry_ips") or []
-            base["entry_exit_same"] = (confirmed in entry_ips) if entry_ips else None
-            token = os.environ.get("IPINFO_TOKEN", "").strip()
-            if token:
-                try:
-                    r3 = proxy_client.get(
-                        IP_INFO_LITE_URL.format(ip=confirmed),
-                        headers={"Authorization": f"Bearer {token}"},
-                        timeout=20,
-                    )
-                    if r3.status_code == 200:
-                        j = r3.json()
-                        base["country"] = j.get("country")
-                        base["country_code"] = j.get("country_code")
-                        base["asn"] = j.get("asn")
-                        base["as_name"] = j.get("org") or j.get("as_name")
-                        base["ipinfo_status"] = "OK"
-                    else:
-                        base["ipinfo_status"] = f"HTTP_{r3.status_code}"
-                except Exception as exc:  # noqa: BLE001
-                    base["ipinfo_status"] = f"ERROR: {redact_uri(str(exc))}"
-        else:
-            base["proxy_http_ok"] = False
-
-        if src1 and src2 and src1 == src2:
-            base["probe_status"] = "PASS"
-        elif src1 or src2:
-            base["probe_status"] = "PARTIAL"
-        else:
-            base["probe_status"] = "FAIL"
-        return redacted_result_dict(base)
-    except Exception as exc:  # noqa: BLE001
-        base["error"] = f"probe failed: {redact_uri(str(exc))}"
-        base["probe_status"] = "FAIL"
-        return redacted_result_dict(base)
-    finally:
-        if proxy_client is not None:
-            try:
-                proxy_client.close()
-            except Exception:  # noqa: BLE001
-                pass
-        if proc is not None:
-            proc.close()
+    """Always fail without side effects while route proof is unavailable."""
+    result = node.public_dict() if isinstance(node, ParsedNode) else {}
+    result.update({
+        "probe_status": "FAIL", "stage": "ROUTE", "error_code": "ROUTE_PROOF_UNAVAILABLE",
+        "route_verified": False, "config_ok": False, "source_count": 0,
+    })
+    return redacted_result_dict(result)
 
 
-def probe_from_file(path: str, limit: int = 2) -> list[dict]:
-    from nodelab.parser import parse_uris
-
-    text = Path(path).read_text(encoding="utf-8")
-    nodes = [n for n in parse_uris(text) if n is not None]
-    return [probe_node(node) for node in nodes[: max(0, limit)]]
+def probe_from_file(path: str, limit: int = 1) -> list[dict]:
+    """Legacy API: intentionally does not even read a sensitive file in F1."""
+    return [redacted_result_dict({
+        "probe_status": "FAIL", "stage": "ROUTE", "error_code": "PROBE_GATE_CLOSED",
+        "route_verified": False, "source_count": 0,
+    })]
 
 
 def save_probe_results(results: list[dict], out_dir: str = "data/probe-results") -> Path:
-    out_path = Path(out_dir)
-    out_path.mkdir(parents=True, exist_ok=True)
-    target = out_path / "latest.json"
-    target.write_text(json.dumps(results, indent=2, ensure_ascii=False), encoding="utf-8")
-    return target
+    """Plaintext latest.json is forbidden; private persistence is a later gate."""
+    raise RuntimeError("RESULT_STORAGE_DISABLED")
