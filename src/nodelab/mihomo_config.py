@@ -202,6 +202,7 @@ class RunContext:
         self.process: MihomoProcess | None = None
         self.raw_child: subprocess.Popen | None = None
         self._windows_owner_sid: str | None = None
+        self._private_tree_removed = False
         self.active = False
         self.closed = False
 
@@ -336,27 +337,53 @@ class RunContext:
         except Exception:
             raise PrivateRunError("PROCESS_START_FAILED") from None
 
+    def _stop_child(self) -> bool:
+        """Stop only the exact owned child; report, never raise."""
+        try:
+            if self.process is not None:
+                self.process.close()
+            elif self.raw_child is not None:
+                stop_owned_process(self.raw_child)
+        except (OSError, ValueError, ProcessLifecycleError):
+            return False
+        return True
+
+    def _remove_private_tree(self) -> bool:
+        """Delete this run's directory (plaintext YAML first); report, never raise."""
+        if self._private_tree_removed:
+            return True
+        if self.run_dir is None:
+            return False
+        try:
+            if self.run_dir.parent != self.root or not self.run_dir.is_dir():
+                return False
+            self._verify(self.root, directory=True)
+            _check_clean_private_tree(self.run_dir)
+            # rmtree unlinks files before their directory, so probe.yaml is
+            # gone even if the directory itself is still a live child's cwd.
+            shutil.rmtree(self.run_dir)
+            if self.run_dir.exists() or self.run_dir.is_symlink():
+                return False
+        except (OSError, ValueError, PrivateRunError):
+            return False
+        self._private_tree_removed = True
+        return True
+
     def close(self) -> None:
         if self.closed:
             return
         if self.run_dir is None:
             self.closed = True
             return
-        try:
-            if self.process is not None:
-                self.process.close()
-            elif self.raw_child is not None:
-                stop_owned_process(self.raw_child)
-            if self.run_dir.parent != self.root or not self.run_dir.is_dir():
-                raise PrivateRunError("SECRET_CLEANUP_FAILED")
-            self._verify(self.root, directory=True)
-            _check_clean_private_tree(self.run_dir)
-            shutil.rmtree(self.run_dir)
-            if self.run_dir.exists() or self.run_dir.is_symlink():
-                raise PrivateRunError("SECRET_CLEANUP_FAILED")
-        except (OSError, ValueError, ProcessLifecycleError, PrivateRunError):
+        # Stop the child first (contract E2), but a stop failure must never
+        # skip deleting the plaintext: an orphaned synthetic child is far less
+        # harmful than a credential left on disk.  Both steps always run and
+        # a single fixed code reports if either one is not confirmed.
+        stopped = self._stop_child()
+        removed = self._remove_private_tree()
+        if not (stopped and removed):
             # Never report a prior success if process/file cleanup is unknown.
-            raise PrivateRunError("SECRET_CLEANUP_FAILED") from None
+            raise PrivateRunError("SECRET_CLEANUP_FAILED")
         self.closed = True
         self.active = False
 

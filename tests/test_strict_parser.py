@@ -94,7 +94,7 @@ def test_trojan_whole_password_and_tls_default(trojan_password):
     node = parse_uri(trojan(trojan_password, "fp=IOS&alpn=h2", "entry.example.invalid"))
     assert node.protocol == "trojan" and node.secret == trojan_password
     assert node.transport == "tcp" and node.tls_mode == "tls"
-    assert node.sni == "entry.example.invalid" and node.client_fingerprint == "iOS"
+    assert node.sni == "entry.example.invalid" and node.client_fingerprint == "ios"
     assert node.alpn == ("h2",)
     assert trojan_password not in repr(node) and trojan_password not in str(node.public_dict())
 
@@ -232,3 +232,76 @@ def test_utf8_oversize_and_empty_batch_are_fixed_failures(vless_uuid):
     too_long = b"X" * 8193
     assert parse_uris(too_long).lines[0].error_code == "LINE_TOO_LONG"
     rejected(vless(vless_uuid, "security=tls&path=" + "X" * 8200), "LINE_TOO_LONG", vless_uuid)
+
+
+# Exact keys of the uTLS fingerprint map in Mihomo v1.19.31
+# component/tls/utls.go (GetFingerprint does a case-sensitive lookup and an
+# unknown value silently degrades to plain Go TLS in transport/vmess/tls.go).
+MIHOMO_V1_19_31_FINGERPRINT_KEYS = frozenset({
+    "chrome", "chrome_psk", "chrome_psk_shuffle", "chrome_padding_psk_shuffle",
+    "chrome_pq", "chrome_pq_psk", "chrome120", "firefox", "firefox120", "safari",
+    "safari16", "ios", "android", "edge", "360", "qq", "randomized",
+})
+
+
+def test_emitted_fingerprints_are_exact_mihomo_map_keys(vless_uuid):
+    from nodelab.parser import _FINGERPRINTS
+
+    assert set(_FINGERPRINTS.values()) <= MIHOMO_V1_19_31_FINGERPRINT_KEYS
+    assert "iOS" not in _FINGERPRINTS.values()  # wiki typo; would be a silent TLS downgrade
+    for spelling in ("ios", "iOS", "IOS"):
+        assert parse_uri(vless(vless_uuid, f"security=tls&fp={spelling}")).client_fingerprint == "ios"
+    rejected(vless(vless_uuid, "security=tls&fp=chrome120"), "UNSUPPORTED_FINGERPRINT", vless_uuid)
+
+
+def test_bom_and_line_edge_whitespace_do_not_reject_valid_lines(vless_uuid, trojan_password):
+    first = vless(vless_uuid, "security=tls")
+    second = trojan(trojan_password)
+    data = b"\xef\xbb\xbf" + first.encode() + b"  \t\r\n \t" + second.encode() + b"\n \t \n"
+    batch = parse_uris(data)
+    assert [line.error_code for line in batch.lines] == ["PROBE_GATE_CLOSED", "PROBE_GATE_CLOSED"]
+    assert batch.lines[0].node is not None and batch.lines[0].node.secret == vless_uuid
+    assert batch.lines[1].node is not None and batch.lines[1].node.secret == trojan_password
+    assert batch.skipped_count == 1
+    # The BOM is only tolerated at the very start of the input, never mid-file.
+    later = first.encode() + b"\n\xef\xbb\xbf" + second.encode() + b"\n"
+    assert [line.error_code for line in parse_uris(later).lines] == ["PROBE_GATE_CLOSED", "UNSUPPORTED_PROTOCOL"]
+    # Interior whitespace is still a syntax error, and parse_uri() itself stays strict.
+    assert parse_uris((first + " #x").encode()).lines[0].error_code == "INVALID_URI"
+    rejected(first + " ", "INVALID_URI", vless_uuid)
+
+
+def test_discarded_remark_percent_is_not_fatal_but_controls_are(vless_uuid):
+    node = parse_uri(vless(vless_uuid, "security=tls") + "#FAKE_ONLY-50%off")
+    assert node.secret == vless_uuid and "50%off" not in repr(node)
+    assert parse_uri(vless(vless_uuid, "security=tls") + "#%E5%89%A9%E4%BD%99%2050%").sni == "entry.example.invalid"
+    rejected(vless(vless_uuid, "security=tls") + "#bad%0Afragment", "INVALID_URI", vless_uuid)
+    rejected(vless(vless_uuid, "security=tls") + "#bad%00", "INVALID_URI", vless_uuid)
+    # Percent strictness still applies where the value is actually used.
+    rejected(vless(vless_uuid, "security=tls&sni=bad%"), "INVALID_PERCENT_ENCODING", vless_uuid)
+
+
+def test_numeric_looking_hosts_never_become_dns_names(vless_uuid):
+    for host in ("0x7f.0.0.1", "0x7f000001", "0X7F.1", "2130706433", "127.1", "0177.0.0.1",
+                 "1.2.3.4.5", "example.123", "203.0.113.0x5"):
+        rejected(vless(vless_uuid, "security=tls&sni=sni.example.invalid", host), "INVALID_HOST", vless_uuid)
+    assert parse_uri(vless(vless_uuid, "security=tls", "3com.example")).entry_host == "3com.example"
+    assert parse_uri(vless(vless_uuid, "security=tls", "203-0-113-5.nip.example")).entry_host == "203-0-113-5.nip.example"
+
+
+def test_ipv4_mapped_ipv6_entry_host_is_interpreter_independent(vless_uuid):
+    node = parse_uri(vless(vless_uuid, "security=tls&sni=sni.example.invalid", "[::ffff:203.0.113.5]"))
+    assert node.entry_host == "::ffff:203.0.113.5"
+    same = parse_uri(vless(vless_uuid, "security=tls&sni=sni.example.invalid", "[::FFFF:cb00:7105]"))
+    assert same.entry_host == node.entry_host
+    assert parse_uri(vless(vless_uuid, "security=tls&sni=sni.example.invalid", "[2001:DB8:0:0::1]")).entry_host == "2001:db8::1"
+
+
+def test_parsed_candidate_has_no_probe_status_and_closed_gate(vless_uuid):
+    line = parse_uris(vless(vless_uuid, "security=tls").encode()).lines[0]
+    assert line.node is not None and line.probe_status is None and line.error_code == "PROBE_GATE_CLOSED"
+    unsupported = parse_uris(vless(vless_uuid, "security=none").encode()).lines[0]
+    assert unsupported.node is None and unsupported.probe_status == "UNSUPPORTED"
+    assert unsupported.error_code == "UNSUPPORTED_SECURITY"
+    malformed = parse_uris(vless(vless_uuid, "security=tls").replace(":443", ":0").encode()).lines[0]
+    assert malformed.probe_status == "FAIL" and malformed.error_code == "INVALID_PORT"

@@ -28,11 +28,20 @@ _QUERY_KEYS = {
     )
 }
 _ALLOWED_ALPN = frozenset({"h2", "http/1.1"})
+# Values are emitted verbatim as Mihomo `client-fingerprint`.  Mihomo
+# v1.19.31 component/tls/utls.go looks the string up case-sensitively in a
+# map whose keys are all lower-case (including "ios"); an unknown value only
+# logs a warning and transport/vmess/tls.go then silently falls back to plain
+# Go TLS.  The wiki spelling "iOS" (copied into NL-REVIEW-002) is therefore a
+# silent downgrade and must never be emitted.
 _FINGERPRINTS = {
     "chrome": "chrome", "firefox": "firefox", "safari": "safari",
-    "edge": "edge", "android": "android", "ios": "iOS", "360": "360", "qq": "qq",
+    "edge": "edge", "android": "android", "ios": "ios", "360": "360", "qq": "qq",
 }
 _BAD_PERCENT = re.compile(r"%(?![0-9A-Fa-f]{2})")
+_NUMERIC_LABEL = re.compile(r"(?:0[xX][0-9A-Fa-f]*|[0-9]+)\Z")
+_UTF8_BOM = b"\xef\xbb\xbf"
+_LINE_EDGE_WHITESPACE = b" \t\r\x0b\x0c"
 _UUID_SHAPE = re.compile(r"[0-9A-Fa-f]{8}(?:-[0-9A-Fa-f]{4}){3}-[0-9A-Fa-f]{12}\Z")
 _SERVICE_NAME = re.compile(r"[A-Za-z0-9._/-]+\Z")
 _SHORT_ID = re.compile(r"(?:[0-9a-fA-F]{2}){1,8}\Z")
@@ -53,6 +62,24 @@ def _decode(raw: str, *, form: bool = False) -> str:
         raise NodeURIParseError("INVALID_UTF8") from None
 
 
+def _canonical_ipv6(addr: ipaddress.IPv6Address) -> str:
+    mapped = addr.ipv4_mapped
+    if mapped is not None:
+        # Python 3.13 changed IPv6Address.compressed for IPv4-mapped addresses
+        # ("::ffff:cb00:7105" -> "::ffff:203.0.113.5"); pin one spelling so
+        # entry_host never depends on the interpreter version.
+        return f"::ffff:{mapped}"
+    return addr.compressed
+
+
+def _looks_numeric(value: str) -> bool:
+    """inet_aton-style hosts (hex/octal/short/decimal) and all-digit TLDs."""
+    labels = value.split(".")
+    return bool(_NUMERIC_LABEL.fullmatch(labels[-1])) or any(
+        label[:2].lower() == "0x" and _NUMERIC_LABEL.fullmatch(label) for label in labels
+    )
+
+
 def _normalize_host(value: str, *, ipv6_bracketed: bool = False) -> str:
     if not value or _has_control(value) or any(ch in value for ch in "%/@?#\\"):
         raise NodeURIParseError("INVALID_HOST")
@@ -63,7 +90,7 @@ def _normalize_host(value: str, *, ipv6_bracketed: bool = False) -> str:
             raise NodeURIParseError("INVALID_HOST") from None
         if addr.is_link_local or addr.is_multicast or addr.is_unspecified:
             raise NodeURIParseError("INVALID_HOST")
-        return addr.compressed
+        return _canonical_ipv6(addr)
     if ":" in value or value.endswith("."):
         raise NodeURIParseError("INVALID_HOST")
     try:
@@ -72,8 +99,9 @@ def _normalize_host(value: str, *, ipv6_bracketed: bool = False) -> str:
             raise NodeURIParseError("INVALID_HOST")
         return str(addr4)
     except ipaddress.AddressValueError:
-        # Invalid numeric dotted quads must not turn into DNS names.
-        if re.fullmatch(r"[0-9.]+", value):
+        # Invalid numeric dotted quads (including "0x7f.0.0.1", "0x7f000001",
+        # "2130706433" or an all-digit TLD) must not turn into DNS names.
+        if re.fullmatch(r"[0-9.]+", value) or _looks_numeric(value):
             raise NodeURIParseError("INVALID_HOST") from None
     try:
         alabel = idna.encode(value, uts46=False, std3_rules=True).decode("ascii").lower()
@@ -238,8 +266,10 @@ def parse_uri(uri: str) -> ParsedNode:
                 secret = str(uuid.UUID(secret))
             except ValueError:
                 raise NodeURIParseError("INVALID_SECRET") from None
-        # Decode fragment once only to check syntax; never store the value.
-        if parsed.fragment and _has_control(_decode(parsed.fragment)):
+        # The remark is discarded and never stored.  Decode it leniently once
+        # only to refuse control characters; a bare '%' in a human label
+        # ("50%off") is not a reason to drop an otherwise valid line.
+        if parsed.fragment and _has_control(urllib.parse.unquote(parsed.fragment, errors="replace")):
             raise NodeURIParseError("INVALID_URI")
         params = _parse_query(parsed.query)
         if "sni" in params and "peer" in params:
@@ -327,9 +357,17 @@ def parse_uri(uri: str) -> ParsedNode:
 
 @dataclass(frozen=True, slots=True, repr=False)
 class ParsedLine:
+    """One physical input line.
+
+    ``probe_status`` is ``None`` for a successfully parsed candidate: parsing
+    is not a probe, and the D4 statuses (PASS/PARTIAL/FAIL/CONFLICT/
+    UNSUPPORTED) describe probe outcomes.  ``error_code`` then carries
+    ``PROBE_GATE_CLOSED`` so the output can never be read as a verdict.
+    """
+
     line_number: int
     node: ParsedNode | None
-    probe_status: str
+    probe_status: str | None
     error_code: str | None
 
     def __repr__(self) -> str:
@@ -358,6 +396,8 @@ def parse_uris(data: bytes | str, *, limit: int | None = None) -> ParseBatch:
             return ParseBatch((ParsedLine(1, None, "FAIL", "INVALID_UTF8"),), 0)
     if not isinstance(data, bytes):
         return ParseBatch((ParsedLine(1, None, "FAIL", "INVALID_URI"),), 0)
+    if data.startswith(_UTF8_BOM):
+        data = data[len(_UTF8_BOM):]  # Windows editors prepend it; only ever at file start
     lines: list[ParsedLine] = []
     skipped = 0
     physical_lines = data.split(b"\n") if data else []
@@ -366,8 +406,9 @@ def parse_uris(data: bytes | str, *, limit: int | None = None) -> ParseBatch:
     for number, raw_line in enumerate(physical_lines, 1):
         if limit is not None and len(lines) >= max(0, limit):
             break
-        if raw_line.endswith(b"\r"):
-            raw_line = raw_line[:-1]
+        # A URI cannot start or end with whitespace and the credential is
+        # never at a line edge, so trimming ASCII whitespace loses nothing.
+        raw_line = raw_line.strip(_LINE_EDGE_WHITESPACE)
         if not raw_line.strip():
             skipped += 1
             continue
@@ -377,7 +418,7 @@ def parse_uris(data: bytes | str, *, limit: int | None = None) -> ParseBatch:
         try:
             uri = raw_line.decode("utf-8", errors="strict")
             node = parse_uri(uri)
-            lines.append(ParsedLine(number, node, "UNSUPPORTED", "PROBE_GATE_CLOSED"))
+            lines.append(ParsedLine(number, node, None, "PROBE_GATE_CLOSED"))
         except UnicodeError:
             lines.append(ParsedLine(number, None, "FAIL", "INVALID_UTF8"))
         except NodeURIParseError as exc:

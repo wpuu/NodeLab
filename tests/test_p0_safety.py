@@ -105,8 +105,14 @@ def test_s9_file_parse_per_line_no_auto_results(tmp_path: Path, capsys):
         public = capsys.readouterr().out
         rows = json.loads(public)
         assert [row["line_number"] for row in rows] == [1, 2, 3]
-        assert rows[0]["probe_status"] == rows[2]["probe_status"] == "UNSUPPORTED"
-        assert rows[1]["error_code"] == "UNSUPPORTED_PROTOCOL"
+        # A parsed candidate is not a probe result: status stays null and the
+        # error_code says why nothing more happened.  Only the bad line gets a
+        # D4 status, and nothing here can be read as a positive verdict.
+        assert rows[0]["probe_status"] is None and rows[2]["probe_status"] is None
+        assert rows[0]["error_code"] == rows[2]["error_code"] == "PROBE_GATE_CLOSED"
+        assert rows[0]["stage"] == rows[2]["stage"] == "PARSE"
+        assert rows[1]["probe_status"] == "UNSUPPORTED" and rows[1]["error_code"] == "UNSUPPORTED_PROTOCOL"
+        assert all(row["route_verified"] is not True and row["probe_status"] != "PASS" for row in rows)
         for value in (first, second, path.name):
             assert value not in public
         assert cli.main(["probe-file", "--file", str(path)]) == 2
@@ -300,6 +306,37 @@ def test_cleanup_failure_is_hard_fail_and_stale_dir_blocks(tmp_path: Path, monke
     finally:
         ctx.close()
     assert not ctx.run_dir.exists()
+
+
+def test_stop_failure_still_deletes_plaintext_and_reports_cleanup_failure(tmp_path: Path, monkeypatch):
+    sentinel = fake_secret()
+    ctx = context_for_test(tmp_path)
+    ctx.__enter__()
+    yaml_path = ctx.write_yaml({"password": sentinel})
+    owned = ctx.spawn_synthetic_process()
+    run_dir = ctx.run_dir
+    try:
+        with monkeypatch.context() as patch:
+            def unkillable(_proc):
+                raise mihomo_process.ProcessLifecycleError()
+            patch.setattr(mihomo_config, "stop_owned_process", unkillable)
+            patch.setattr(mihomo_process, "stop_owned_process", unkillable)
+            with pytest.raises(PrivateRunError) as info:
+                ctx.close()
+        assert info.value.code == "SECRET_CLEANUP_FAILED"
+        assert sentinel not in str(info.value)
+        # The credential must not outlive the run just because the child did.
+        assert not yaml_path.exists() and not run_dir.exists()
+        assert not ctx.closed and owned.poll() is None  # honestly still owned, not "closed"
+        # A later retry with a stoppable child completes the same run.
+        ctx.close()
+        assert ctx.closed and owned.poll() is not None and not run_dir.exists()
+    finally:
+        if owned.poll() is None:
+            owned.kill()
+            owned.wait(timeout=5)
+        if run_dir.exists():
+            shutil.rmtree(run_dir, ignore_errors=True)
 
 
 @pytest.mark.skipif(os.name == "nt", reason="real Windows junction covered in Windows-only gate")
