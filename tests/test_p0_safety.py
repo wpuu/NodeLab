@@ -196,9 +196,13 @@ def test_missing_file_path_cannot_be_echoed(capsys):
     assert json.loads(output.out)["error_code"] == "INPUT_FILE_UNSAFE"
 
 
-def test_legacy_live_engine_entry_points_disabled():
+def test_legacy_live_engine_entry_points_disabled(monkeypatch):
     sentinel = fake_secret()
     node = parse_uri(fake_trojan_uri(sentinel))
+    # F2b replaced the F1 hard `None` with a pinned resolver. With no pin
+    # configured it must still refuse to discover anything, and it must
+    # never fall back to PATH (see tests/test_engine_binary.py).
+    monkeypatch.delenv("NODELAB_MIHOMO_EXE", raising=False)
     assert mihomo_process.find_mihomo_exe() is None
     assert not hasattr(mihomo_process, "cleanup_stale_mihomo")
     assert not hasattr(mihomo_process, "list_mihomo_pids")

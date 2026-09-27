@@ -16,6 +16,8 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
+from nodelab import engine_binary
+
 STOP_BUDGET_SECONDS = 5.0  # NL-REVIEW-002 F.3 cleanup window
 
 
@@ -210,18 +212,28 @@ def terminate_verified_process(expected: ProcessIdentity, *, budget: float = STO
 
 
 def find_mihomo_exe() -> Path | None:
-    """Do not select PATH/unverified executables until F2's pinned verifier."""
-    return None
+    """The explicitly pinned executable, or None. NEVER searches PATH.
+
+    F2b replaced the F1 hard `None` with a pinned resolver. It still returns
+    None unless the Owner has configured an absolute path, so name-based
+    discovery of the Owner's own Mihomo remains impossible.
+    """
+    try:
+        return engine_binary.resolve_pinned_exe()
+    except engine_binary.BinaryVerificationError:
+        return None
 
 
 def run_version_check(exe: Path) -> tuple[bool, str]:
-    """No unverified binary execution or raw stdout in F1."""
-    return False, "BINARY_MISMATCH"
+    """Pinned bytes AND pinned version, or a fixed failure code."""
+    return engine_binary.verify_pinned_binary(exe)
 
 
-def test_config(exe: Path, config_path: Path) -> tuple[bool, str]:
-    """Disabled until F2 implements the pinned binary/config path contract."""
-    return False, "PROBE_GATE_CLOSED"
+def test_config(exe: Path, config_path: Path, *, work_dir: Path | None = None) -> tuple[bool, str]:
+    """`-t` against the pinned engine. Necessary, not sufficient (NL-REVIEW-004)."""
+    return engine_binary.config_test(
+        exe, config_path, work_dir=work_dir if work_dir is not None else Path(config_path).parent
+    )
 
 
 def stop_owned_process(proc: subprocess.Popen, *, budget: float = STOP_BUDGET_SECONDS) -> None:
