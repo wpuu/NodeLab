@@ -1,4 +1,4 @@
-"""Legacy parser sanity with runtime-generated fictional UUIDs only."""
+"""VLESS URI parsing uses runtime-generated fictional UUIDs only."""
 
 import secrets
 import uuid
@@ -13,8 +13,8 @@ from nodelab.types import NodeURIParseError
 def vless_ws():
     fake_uuid = str(uuid.uuid4())
     uri = (f"vless://{fake_uuid}@203.0.113.10:443"
-           "?type=ws&security=tls&path=%2Fws-node&host=203.0.113.10&fp=chrome"
-           "#WS-node-fixture")
+           "?type=ws&security=tls&path=%2Fws-node&host=203.0.113.10"
+           "&sni=203.0.113.10&fp=chrome#WS-node-fixture")
     return uri, fake_uuid
 
 
@@ -22,10 +22,10 @@ def test_vless_ws_fields_are_private(vless_ws):
     uri, fake_uuid = vless_ws
     node = parse_uri(uri)
     assert node.protocol == "vless" and node.entry_host == "203.0.113.10"
-    assert node.entry_port == 443 and node.transport == "ws" and node.tls is True
-    assert node.sni == "203.0.113.10" and node.host_header == "203.0.113.10"
-    assert node.path == "/ws-node" and node.client_fingerprint == "chrome"
-    assert node.display_name == "WS-node-fixture" and node.secret == fake_uuid
+    assert node.entry_port == 443 and node.transport == "ws" and node.tls_mode == "tls"
+    assert node.sni == "203.0.113.10" and node.ws_host == "203.0.113.10"
+    assert node.ws_path == "/ws-node" and node.client_fingerprint == "chrome"
+    assert node.secret == fake_uuid and not hasattr(node, "display_name")
 
 
 def test_vless_public_dict_has_no_uuid(vless_ws):
@@ -46,7 +46,7 @@ def test_vless_path_hint_is_not_hop_count():
     fake_uuid = str(uuid.uuid4())
     uri = (f"vless://{fake_uuid}@198.51.100.7:443"
            "?type=ws&security=tls&path=%2Fproxyip%3D2.2.2.2%3A443%2C3.3.3.3%3A443"
-           "#fixture")
+           "&host=proxy.example.invalid&sni=proxy.example.invalid#fixture")
     node = parse_uri(uri)
     assert "contains_proxyip_list" in node.path_features
     assert "2-hop" not in repr(node) and "3-hop" not in repr(node)
@@ -71,13 +71,13 @@ def test_vless_unsupported_scheme_rejected():
     for scheme in ("vmess", "ss"):
         with pytest.raises(NodeURIParseError) as info:
             parse_uri(f"{scheme}://{fake_value}@198.51.100.9:443")
-        assert info.value.code == "UNSUPPORTED_PROTOCOL"
+        assert info.value.code == "UNSUPPORTED_PROTOCOL" and info.value.probe_status == "UNSUPPORTED"
 
 
-def test_vless_chinese_fragment_stays_private():
+def test_vless_chinese_fragment_is_never_stored():
     fake_uuid = str(uuid.uuid4())
-    uri = (f"vless://{fake_uuid}@198.51.100.9:443?security=tls"
+    uri = (f"vless://{fake_uuid}@198.51.100.9:443?security=tls&sni=fixture.example.invalid"
            "#%E4%B8%AD%E6%96%87%E5%A4%87%E6%B3%A8")
     node = parse_uri(uri)
-    assert node.display_name == "中文备注"
-    assert "中文备注" not in str(node.public_dict())
+    assert not hasattr(node, "display_name")
+    assert "中文备注" not in str(node.public_dict()) and "中文备注" not in repr(node)

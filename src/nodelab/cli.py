@@ -8,12 +8,10 @@ import sys
 from pathlib import Path
 from typing import Any
 
-from nodelab.parser import parse_uri
-from nodelab.redaction import redacted_node_dict, redacted_result_dict
-from nodelab.types import NodeURIParseError
+from nodelab.parser import parse_uris
+from nodelab.redaction import redacted_result_dict
 
 _MAX_INPUT_BYTES = 512 * 1024
-_MAX_LINE_BYTES = 8192
 
 
 class _ArgumentsInvalid(Exception):
@@ -37,28 +35,10 @@ def _failure(code: str, stage: str = "INPUT") -> int:
 
 def _parse_lines(data: bytes, limit: int) -> list[dict[str, Any]]:
     results: list[dict[str, Any]] = []
-    for line_number, line in enumerate(data.split(b"\n"), 1):
-        if len(results) >= limit:
-            break
-        if line.endswith(b"\r"):
-            line = line[:-1]
-        if not line.strip():
-            continue
-        if len(line) > _MAX_LINE_BYTES:
-            result = {"line_number": line_number, "probe_status": "FAIL", "stage": "PARSE", "error_code": "LINE_TOO_LONG"}
-        else:
-            try:
-                node = parse_uri(line.decode("utf-8", errors="strict"))
-                result = redacted_node_dict(node)
-                # Parsing under the old model does not certify a probe dialect.
-                result.update(line_number=line_number, probe_status="UNSUPPORTED", stage="PARSE",
-                              error_code="PROBE_GATE_CLOSED")
-            except UnicodeDecodeError:
-                result = {"line_number": line_number, "probe_status": "FAIL", "stage": "PARSE", "error_code": "INVALID_UTF8"}
-            except NodeURIParseError as exc:
-                result = {"line_number": line_number, "probe_status": "FAIL", "stage": "PARSE", "error_code": exc.code}
-            except (ValueError, OverflowError):
-                result = {"line_number": line_number, "probe_status": "FAIL", "stage": "PARSE", "error_code": "INVALID_URI"}
+    for line in parse_uris(data, limit=limit).lines:
+        result = line.node.public_dict() if line.node is not None else {}
+        result.update(line_number=line.line_number, probe_status=line.probe_status,
+                      stage="PARSE", error_code=line.error_code)
         results.append(redacted_result_dict(result))
     return results
 

@@ -13,7 +13,7 @@ from nodelab.types import NodeURIParseError
 def test_vless_json_has_no_uuid_or_fragment():
     fake_uuid = str(uuid.uuid4())
     fragment = "FAKE_ONLY_" + secrets.token_urlsafe(25)
-    uri = f"vless://{fake_uuid}@198.51.100.44:443?security=tls#{fragment}"
+    uri = f"vless://{fake_uuid}@198.51.100.44:443?security=tls&sni=fixture.example.invalid#{fragment}"
     node = parse_uri(uri)
     public = json.dumps(redacted_node_dict(node), ensure_ascii=False)
     assert fake_uuid not in public and fragment not in public
@@ -23,7 +23,8 @@ def test_vless_json_has_no_uuid_or_fragment():
 
 def test_trojan_password_inside_uri_component_never_enters_public_view():
     password = "FAKE_ONLY_" + secrets.token_urlsafe(25) + "@colons:allowed"
-    uri = f"trojan://{quote(password, safe='')}@198.51.100.45:443?security=tls#{quote(password)}"
+    uri = (f"trojan://{quote(password, safe='')}@198.51.100.45:443"
+           f"?security=tls&sni=fixture.example.invalid#{quote(password)}")
     node = parse_uri(uri)
     assert node.secret == password
     result = redacted_result_dict(node.public_dict() | {"redacted_uri": redact_uri(uri)})
@@ -46,7 +47,8 @@ def test_exception_has_fixed_code_only():
 def test_arbitrary_nested_strings_and_keys_are_dropped():
     secret = "FAKE_ONLY_" + secrets.token_urlsafe(25)
     fake_uuid = str(uuid.uuid4())
-    base = redacted_node_dict(parse_uri(f"vless://{fake_uuid}@198.51.100.47:443"))
+    base = redacted_node_dict(parse_uri(
+        f"vless://{fake_uuid}@198.51.100.47:443?security=tls&sni=fixture.example.invalid"))
     base["note"] = {secret: [{"password": secret}]}
     base["error_code"] = "FAIL_" + secret
     result = redacted_result_dict(base)

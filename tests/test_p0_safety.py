@@ -32,25 +32,29 @@ def context_for_test(tmp_path: Path) -> RunContext:
 
 
 def fake_trojan_uri(secret: str) -> str:
-    return f"trojan://{quote(secret, safe='')}@198.51.100.20:443?security=tls"
+    return f"trojan://{quote(secret, safe='')}@198.51.100.20:443?security=tls&sni=fixture.example.invalid"
 
 
 def test_s1_s4_private_carriers_and_public_views():
     sentinel = fake_secret()
+    domain_sentinel = "fakeonly" + secrets.token_hex(12)  # legal IDNA label
     password = sentinel + ":" + "@"
     uri = (f"trojan://{quote(password, safe='')}@198.51.100.20:443"
-           f"?type=ws&security=tls&host={sentinel}.invalid&sni={sentinel}.invalid"
-           f"&path=%2F{sentinel}&auth={quote(sentinel)}#{quote(sentinel)}")
+           f"?type=ws&security=tls&host={domain_sentinel}.invalid&sni={domain_sentinel}.invalid"
+           f"&path=%2F{sentinel}#{quote(sentinel)}")
     node = parse_uri(uri)
-    assert node.secret == password
-    assert node.path.endswith(sentinel)
-    assert node.display_name == sentinel
-    assert sentinel in node.extra_query["auth"]
+    assert node.secret == password and node.ws_path.endswith(sentinel)
+    assert node.ws_host == node.sni == f"{domain_sentinel}.invalid"
+    assert not hasattr(node, "display_name") and not hasattr(node, "extra_query")
     out = json.dumps(redacted_node_dict(node), ensure_ascii=False) + repr(node) + str(node)
     out += redact_uri(uri)
-    for value in (sentinel, quote(sentinel), quote(password, safe=''), password, uri):
+    for value in (sentinel, domain_sentinel, quote(password, safe=''), password, uri):
         assert value not in out
     assert "display_name" not in out and "redacted_uri" not in out
+    with pytest.raises(NodeURIParseError) as info:
+        parse_uri(uri.replace("#", f"&auth={quote(sentinel)}#"))
+    assert info.value.code == "UNSUPPORTED_QUERY_PARAM"
+    assert info.value.probe_status == "UNSUPPORTED" and sentinel not in repr(info.value)
 
 
 def test_s5_s6_s7_fixed_public_schema_and_nested_adversary():

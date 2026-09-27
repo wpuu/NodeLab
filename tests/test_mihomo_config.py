@@ -15,7 +15,7 @@ from nodelab.parser import parse_uri
 
 def _node():
     password = "FAKE_ONLY_" + secrets.token_urlsafe(25)
-    return parse_uri(f"trojan://{password}@203.0.113.50:443?security=tls"), password
+    return parse_uri(f"trojan://{password}@203.0.113.50:443?security=tls&sni=fixture.example.invalid"), password
 
 
 def _context(tmp_path: Path) -> RunContext:
