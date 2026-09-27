@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from typing import Any
 
-from nodelab.types import ParsedNode
+from nodelab.types import PROBE_GATE_OPEN, ParsedNode
 
 _STATUS = frozenset({"PASS", "FAIL", "PARTIAL", "CONFLICT", "UNSUPPORTED"})
 _STAGE = frozenset({
@@ -69,9 +69,11 @@ def redacted_result_dict(result: Any) -> dict[str, Any] | list[dict[str, Any]]:
     if code is not None and _enum(code, _ERROR_CODE) is None:
         code = "PUBLIC_SCHEMA_REJECTED"
     status = _enum(result.get("probe_status"), _STATUS)
-    # F1 has NO trusted route-evidence producer. Even a caller-constructed
-    # result with route_verified=True must not publish a positive verdict.
-    gated = status in {"PASS", "PARTIAL", "CONFLICT"}
+    # While the gate is closed there is NO trusted route-evidence producer:
+    # even a caller-constructed result with route_verified=True must not
+    # publish a positive verdict.  Verdict authority itself lives in probe.py;
+    # this is only the last line of defence behind types.PROBE_GATE_OPEN.
+    gated = not PROBE_GATE_OPEN and status in {"PASS", "PARTIAL", "CONFLICT"}
     if gated:
         status, code = "FAIL", "ROUTE_PROOF_UNAVAILABLE"
 

@@ -8,7 +8,13 @@ credentials. Never log/serialize the dataclass itself.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Final
+
+# The ONE switch for publishing a positive verdict.  It stays False until F3
+# wires per-request route proof into probe.py and W2 passes; flipping it must
+# come with the F3 positive/negative route-proof tests in the same change.
+# probe.py, redaction.py and cli.py all consult this constant and nothing else.
+PROBE_GATE_OPEN: Final[bool] = False
 
 _PARSE_CODES = frozenset({
     "INVALID_URI", "INVALID_UTF8", "INVALID_PERCENT_ENCODING", "INVALID_HOST",

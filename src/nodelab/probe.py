@@ -13,7 +13,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from nodelab.redaction import redacted_result_dict
-from nodelab.types import ParsedNode
+from nodelab.types import PROBE_GATE_OPEN, ParsedNode
 
 
 @dataclass(frozen=True, repr=False)
@@ -84,6 +84,9 @@ def decide_probe_status(
 
 def probe_node(node: ParsedNode) -> dict:
     """Always fail without side effects while route proof is unavailable."""
+    if PROBE_GATE_OPEN:
+        # Tripwire: F3 must replace this function together with the switch.
+        raise RuntimeError("PROBE_GATE_OPEN_WITHOUT_ROUTE_PROOF")
     result = node.public_dict() if isinstance(node, ParsedNode) else {}
     result.update({
         "probe_status": "FAIL", "stage": "ROUTE", "error_code": "ROUTE_PROOF_UNAVAILABLE",

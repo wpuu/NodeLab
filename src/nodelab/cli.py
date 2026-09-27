@@ -8,8 +8,10 @@ import sys
 from pathlib import Path
 from typing import Any
 
+from nodelab.mihomo_config import PrivateRunError, recover_stale_runs
 from nodelab.parser import parse_uris
 from nodelab.redaction import redacted_result_dict
+from nodelab.types import PROBE_GATE_OPEN
 
 _MAX_INPUT_BYTES = 512 * 1024
 
@@ -74,6 +76,23 @@ def _cmd_parse_stdin(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_recover(args: argparse.Namespace) -> int:
+    """Explicit crash recovery of the private root; never a global process sweep."""
+    if not args.confirm:
+        return _failure("INVALID_ARGUMENTS", "CLEANUP")
+    try:
+        root = Path(args.root) if args.root else None
+        if root is not None and not root.is_absolute():
+            return _failure("INVALID_ARGUMENTS", "CLEANUP")
+        rows = recover_stale_runs(root)
+    except PrivateRunError as exc:
+        return _failure(exc.code, "CLEANUP")
+    except (OSError, ValueError):
+        return _failure("SECRET_CLEANUP_FAILED", "CLEANUP")
+    _emit(rows)
+    return 0 if all(row.get("error_code") is None for row in rows) else 2
+
+
 def main(argv: list[str] | None = None) -> int:
     if argv is None:
         argv = sys.argv[1:]
@@ -92,6 +111,9 @@ def main(argv: list[str] | None = None) -> int:
     p_probe.add_argument("--file", required=True)
     p_probe.add_argument("--limit", type=int, default=1)
     sub.add_parser("probe-stdin", help="Reserved until route-proof and Windows gates")
+    p_rec = sub.add_parser("recover", help="Verified cleanup of crashed private runs (no process-name sweep)")
+    p_rec.add_argument("--confirm", action="store_true", help="Required: may stop an identity-verified orphaned child")
+    p_rec.add_argument("--root", default=None, help="Private root (Windows: fixed; POSIX: per-user default)")
     try:
         args = parser.parse_args(argv)
     except _ArgumentsInvalid:
@@ -103,9 +125,13 @@ def main(argv: list[str] | None = None) -> int:
         return _cmd_parse_file(args)
     if args.command == "parse-stdin":
         return _cmd_parse_stdin(args)
+    if args.command == "recover":
+        return _cmd_recover(args)
     if args.command in {"probe-file", "probe-stdin"}:
-        # Do not even open the input while P0-01/03/07 remain unclosed.
-        return _failure("PROBE_GATE_CLOSED", "ROUTE")
+        if not PROBE_GATE_OPEN:
+            # Do not even open the input while P0-01/03/07 remain unclosed.
+            return _failure("PROBE_GATE_CLOSED", "ROUTE")
+        return _failure("PROBE_GATE_CLOSED", "ROUTE")  # F3 replaces this branch with the real probe path
     parser.print_help()
     return 1
 

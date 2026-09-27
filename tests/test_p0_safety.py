@@ -8,14 +8,18 @@ import secrets
 import shutil
 import subprocess
 import sys
+import time
 import uuid
 from pathlib import Path
 from urllib.parse import quote
 
 import pytest
 
+import nodelab
 from nodelab import cli, mihomo_config, mihomo_process
-from nodelab.mihomo_config import PrivateRunError, RunContext, scrub_yaml_for_display
+from nodelab.mihomo_config import PrivateRunError, RunContext, recover_stale_runs, scrub_yaml_for_display
+from nodelab.mihomo_process import ProcessIdentity, process_identity, stop_owned_process, terminate_verified_process
+from nodelab.types import PROBE_GATE_OPEN
 from nodelab.parser import parse_uri, redact_uri
 from nodelab.probe import RouteObservation, decide_probe_status, probe_from_file, probe_node, save_probe_results
 from nodelab.redaction import redacted_node_dict, redacted_result_dict
@@ -33,6 +37,65 @@ def context_for_test(tmp_path: Path) -> RunContext:
 
 def fake_trojan_uri(secret: str) -> str:
     return f"trojan://{quote(secret, safe='')}@198.51.100.20:443?security=tls&sni=fixture.example.invalid"
+
+
+def helper_env() -> dict[str, str]:
+    env = {k: v for k, v in os.environ.items() if k.upper() in {
+        "SYSTEMROOT", "WINDIR", "PATH", "TEMP", "TMP", "TMPDIR", "USERPROFILE", "HOMEDRIVE", "HOMEPATH",
+        "PSMODULEPATH", "PYTHONHOME", "PYTHONUTF8", "PYTHONIOENCODING",
+    }}
+    env["PYTHONPATH"] = str(Path(nodelab.__file__).resolve().parent.parent)
+    env["PYTHONDONTWRITEBYTECODE"] = "1"
+    return env
+
+
+def root_argument(tmp_path: Path) -> list[str]:
+    return [] if os.name == "nt" else [str(tmp_path / "private")]
+
+
+# Simulated hard crash of an owner: private YAML + synthetic child exist,
+# then the process dies without finally/atexit.  The sentinel arrives on
+# stdin, never through argv or the environment.
+CRASHING_OWNER = """
+import json, os, sys
+from pathlib import Path
+from nodelab.mihomo_config import RunContext
+ctx = RunContext(Path(sys.argv[1]) if len(sys.argv) > 1 else None)
+ctx.__enter__()
+ctx.write_yaml({"password": sys.stdin.readline().strip()})
+child = ctx.spawn_synthetic_process()
+marker = json.loads((ctx.run_dir / ".owner.json").read_text(encoding="utf-8"))
+print(json.dumps({"run_dir": str(ctx.run_dir), "child_pid": child.pid,
+                  "child_create_time": marker["child_create_time"],
+                  "child_exe_fingerprint": marker["child_exe_fingerprint"]}), flush=True)
+os._exit(0)
+"""
+
+# A live owner in another process: enters a run and waits for stdin EOF.
+LIVE_OWNER = """
+import sys
+from pathlib import Path
+from nodelab.mihomo_config import RunContext
+with RunContext(Path(sys.argv[1]) if len(sys.argv) > 1 else None) as ctx:
+    ctx.write_yaml({"password": sys.stdin.readline().strip()})
+    print("ready", flush=True)
+    sys.stdin.read()
+"""
+
+
+def external_sleeper() -> subprocess.Popen:
+    return subprocess.Popen([sys.executable, "-c", "import time;time.sleep(60)"],
+                            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                            env=helper_env())
+
+
+def stop(proc: subprocess.Popen) -> None:
+    if proc.poll() is None:
+        proc.kill()
+    try:
+        proc.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        pass
 
 
 def test_s1_s4_private_carriers_and_public_views():
@@ -270,27 +333,165 @@ def test_terminate_error_falls_back_to_same_child_kill(tmp_path: Path, monkeypat
     assert ctx.closed and not ctx.run_dir.exists()
 
 
-def test_crash_recovery_is_fail_closed_not_global_kill(tmp_path: Path):
+def test_crash_residue_blocks_until_verified_recovery_stops_only_own_orphan(tmp_path: Path):
     sentinel = fake_secret()
-    ctx = context_for_test(tmp_path)
-    ctx.__enter__()
+    external = external_sleeper()
+    crasher = subprocess.Popen([sys.executable, "-c", CRASHING_OWNER, *root_argument(tmp_path)],
+                               stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                               env=helper_env(), text=True, encoding="utf-8")
     try:
-        ctx.write_yaml({"password": sentinel})
-        with pytest.raises(PrivateRunError) as info:
+        crasher.stdin.write(sentinel + "\n")
+        crasher.stdin.flush()
+        facts = json.loads(crasher.stdout.readline())
+        assert crasher.wait(timeout=20) == 0
+        run_dir = Path(facts["run_dir"])
+        orphan = ProcessIdentity(facts["child_pid"], facts["child_create_time"], facts["child_exe_fingerprint"])
+        # After a hard crash the plaintext and the child are still there ...
+        assert sentinel in (run_dir / "probe.yaml").read_text(encoding="utf-8")
+        assert orphan.matches(process_identity(orphan.pid))
+        # ... and every new run is refused until the explicit recovery step.
+        with pytest.raises(PrivateRunError) as blocked:
             context_for_test(tmp_path).__enter__()
-        assert info.value.code == "RECOVERY_REVIEW_REQUIRED"
-        assert ctx.run_dir.is_dir()  # forced OS death cannot run finally
+        assert blocked.value.code == "RECOVERY_REVIEW_REQUIRED"
+        assert external.poll() is None
+
+        rows = recover_stale_runs(run_dir.parent)
+        assert [row["error_code"] for row in rows] == [None]
+        assert rows[0]["stage"] == "CLEANUP" and rows[0]["probe_status"] is None
+        assert sentinel not in json.dumps(rows) and str(run_dir) not in json.dumps(rows)
+        assert not run_dir.exists()
+        assert not orphan.matches(process_identity(orphan.pid))  # exact orphan stopped ...
+        assert external.poll() is None  # ... unrelated process untouched
+        assert not [entry for entry in run_dir.parent.iterdir()]
+        with context_for_test(tmp_path) as again:
+            again.write_yaml({"password": fake_secret()})
+        assert again.closed and not again.run_dir.exists()
     finally:
-        ctx.close()  # the synthetic test itself always cleans up
-    assert not ctx.run_dir.exists()
+        stop(external)
+        stop(crasher)
+        crasher.stdin.close()
+        crasher.stdout.close()
 
 
-def test_cleanup_failure_is_hard_fail_and_stale_dir_blocks(tmp_path: Path, monkeypatch):
+def test_live_runs_coexist_and_are_never_recovered(tmp_path: Path):
+    other = subprocess.Popen([sys.executable, "-c", LIVE_OWNER, *root_argument(tmp_path)],
+                             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                             env=helper_env(), text=True, encoding="utf-8")
+    contexts: list[RunContext] = []
+    try:
+        other.stdin.write(fake_secret() + "\n")
+        other.stdin.flush()
+        assert other.stdout.readline().strip() == "ready"
+        for _ in range(10):  # V0 spec: up to 10 concurrent synthetic probes
+            ctx = context_for_test(tmp_path)
+            ctx.__enter__()
+            ctx.write_yaml({"password": fake_secret()})
+            contexts.append(ctx)
+        root = contexts[0].root
+        assert len({ctx.run_dir for ctx in contexts}) == 10
+        assert recover_stale_runs(root) == []  # live runs are skipped, not "recovered"
+        assert all(ctx.run_dir.is_dir() for ctx in contexts)
+    finally:
+        for ctx in contexts:
+            ctx.close()
+        other.stdin.close()
+        try:
+            assert other.wait(timeout=20) == 0
+        finally:
+            stop(other)
+            other.stdout.close()
+    assert all(ctx.closed and not ctx.run_dir.exists() for ctx in contexts)
+    assert not [entry for entry in root.iterdir()]
+
+
+def test_recovery_never_touches_unverifiable_residue_or_foreign_pids(tmp_path: Path):
+    external = external_sleeper()
+    abandoned: list[RunContext] = []
+
+    def prepare(marker_patch: dict, extra_file: bool = False) -> RunContext:
+        # Entered while every earlier fixture is still live (locks held);
+        # all locks are dropped together below to simulate dead owners.
+        ctx = context_for_test(tmp_path)
+        ctx.__enter__()
+        ctx.write_yaml({"password": fake_secret()})
+        marker_path = ctx.run_dir / ".owner.json"
+        marker = json.loads(marker_path.read_text(encoding="utf-8"))
+        marker["owner_create_time"] = (marker["owner_create_time"] or 0) + 1  # owner "dead" (pid reused)
+        marker.update(marker_patch)
+        marker_path.write_text(json.dumps(marker), encoding="utf-8")
+        if extra_file:
+            (ctx.run_dir / "unexpected.txt").write_text("not ours", encoding="utf-8")
+        abandoned.append(ctx)
+        return ctx
+
+    try:
+        real = process_identity(external.pid)
+        assert real is not None and real.pid == external.pid
+        # A: marker names a different run -> not ours to judge; nothing is deleted or killed.
+        foreign = prepare({"run_id": secrets.token_hex(16), "child_pid": external.pid,
+                           "child_create_time": real.create_time, "child_exe_fingerprint": real.exe_fingerprint})
+        # B: our run, but the recorded child identity no longer matches this pid -> delete, never signal.
+        reused = prepare({"child_pid": external.pid, "child_create_time": real.create_time + 1,
+                          "child_exe_fingerprint": real.exe_fingerprint})
+        # C: unexpected content inside the run dir -> review only.
+        odd = prepare({}, extra_file=True)
+        for ctx in abandoned:
+            ctx._drop_lock()  # the owners "die" without cleanup
+        with pytest.raises(PrivateRunError):
+            context_for_test(tmp_path).__enter__()
+        rows = recover_stale_runs(foreign.root)
+        by_dir = dict(zip(sorted(ctx.run_dir.name for ctx in abandoned), rows))
+        assert by_dir[foreign.run_dir.name]["error_code"] == "RECOVERY_REVIEW_REQUIRED" and foreign.run_dir.is_dir()
+        assert by_dir[reused.run_dir.name]["error_code"] is None and not reused.run_dir.exists()
+        assert by_dir[odd.run_dir.name]["error_code"] == "RECOVERY_REVIEW_REQUIRED" and odd.run_dir.is_dir()
+        assert external.poll() is None
+        assert terminate_verified_process(ProcessIdentity(external.pid, real.create_time + 1, None)) is True
+        assert external.poll() is None  # identity mismatch: nothing was signalled
+    finally:
+        stop(external)
+        for ctx in abandoned:
+            try:
+                ctx.close()  # the synthetic test always cleans its own fixtures
+            except PrivateRunError:
+                pass
+    assert not [entry for entry in abandoned[0].root.iterdir()]
+
+
+def test_recover_cli_requires_confirmation_and_reports_fixed_rows(tmp_path: Path, capsys):
+    assert cli.main(["recover"]) == 2
+    assert json.loads(capsys.readouterr().out)["error_code"] == "INVALID_ARGUMENTS"
+    assert cli.main(["recover", "--confirm", "--root", "relative/dir"]) == 2
+    assert json.loads(capsys.readouterr().out)["error_code"] == "INVALID_ARGUMENTS"
     sentinel = fake_secret()
     ctx = context_for_test(tmp_path)
     ctx.__enter__()
     ctx.write_yaml({"password": sentinel})
-    real_rmtree = shutil.rmtree
+    marker_path = ctx.run_dir / ".owner.json"
+    marker = json.loads(marker_path.read_text(encoding="utf-8"))
+    marker["owner_create_time"] = (marker["owner_create_time"] or 0) + 1
+    marker_path.write_text(json.dumps(marker), encoding="utf-8")
+    ctx._drop_lock()
+    try:
+        assert cli.main(["recover", "--confirm", "--root", str(ctx.root)]) == 0
+        out = capsys.readouterr()
+        rows = json.loads(out.out)
+        assert [row["error_code"] for row in rows] == [None] and rows[0]["stage"] == "CLEANUP"
+        assert sentinel not in out.out + out.err and str(ctx.root) not in out.out + out.err
+        assert not ctx.run_dir.exists()
+        assert cli.main(["recover", "--confirm", "--root", str(ctx.root)]) == 0
+        assert json.loads(capsys.readouterr().out) == []
+    finally:
+        try:
+            ctx.close()
+        except PrivateRunError:
+            pass
+
+
+def test_cleanup_failure_is_hard_fail_but_residue_stays_owned(tmp_path: Path, monkeypatch):
+    sentinel = fake_secret()
+    ctx = context_for_test(tmp_path)
+    ctx.__enter__()
+    ctx.write_yaml({"password": sentinel})
     with monkeypatch.context() as patch:
         def deny(_path):
             raise PermissionError(sentinel)
@@ -300,12 +501,64 @@ def test_cleanup_failure_is_hard_fail_and_stale_dir_blocks(tmp_path: Path, monke
         assert info.value.code == "SECRET_CLEANUP_FAILED"
         assert sentinel not in str(info.value)
     try:
-        with pytest.raises(PrivateRunError) as blocked:
-            context_for_test(tmp_path).__enter__()
-        assert blocked.value.code == "RECOVERY_REVIEW_REQUIRED"
+        # The failed owner is alive and still holds its lock: the residue is
+        # owned, not crashed, so other runs proceed and recovery skips it.
+        with context_for_test(tmp_path) as other:
+            other.write_yaml({"password": fake_secret()})
+        assert recover_stale_runs(ctx.root) == [] and ctx.run_dir.is_dir()
     finally:
         ctx.close()
-    assert not ctx.run_dir.exists()
+    assert ctx.closed and not ctx.run_dir.exists()
+
+
+def test_marker_carries_identities_but_no_secret_or_path(tmp_path: Path):
+    sentinel = fake_secret()
+    ctx = context_for_test(tmp_path)
+    with ctx:
+        ctx.write_yaml({"password": sentinel})
+        child = ctx.spawn_synthetic_process()
+        marker = json.loads((ctx.run_dir / ".owner.json").read_text(encoding="utf-8"))
+        assert marker["run_id"] == ctx.run_id and marker["owner_pid"] == os.getpid()
+        assert marker["child_pid"] == child.pid
+        own = process_identity(os.getpid())
+        if own is not None:  # platforms with a creation stamp must record it
+            assert marker["owner_create_time"] == own.create_time
+            assert marker["child_create_time"] == process_identity(child.pid).create_time
+        text = json.dumps(marker)
+        assert sentinel not in text and str(ctx.run_dir) not in text and sys.executable not in text
+    assert process_identity(child.pid) is None or process_identity(child.pid).create_time != marker["child_create_time"]
+
+
+def test_write_yaml_can_be_rewritten_by_the_same_run_only(tmp_path: Path):
+    first, second = fake_secret(), fake_secret()
+    ctx = context_for_test(tmp_path)
+    with ctx:
+        path = ctx.write_yaml({"password": first})
+        assert ctx.write_yaml({"password": second}) == path  # one retry per port attempt (F.4)
+        text = path.read_text(encoding="utf-8")
+        assert second in text and first not in text
+        if os.name != "nt":
+            assert path.stat().st_mode & 0o777 == 0o600
+    assert not path.exists()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="SIGTERM cannot be ignored on Windows; terminate is already forceful")
+def test_stop_owned_process_stays_within_the_cleanup_budget():
+    stubborn = subprocess.Popen(
+        [sys.executable, "-c", "import signal,sys,time; signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+                               "print('armed', flush=True); time.sleep(60)"],
+        stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, env=helper_env(),
+    )
+    try:
+        assert stubborn.stdout.readline().strip() == b"armed"
+        started = time.monotonic()
+        stop_owned_process(stubborn)
+        elapsed = time.monotonic() - started
+        assert stubborn.poll() is not None
+        assert 2.5 <= elapsed <= 5.5, elapsed  # terminate ignored, kill within one 5 s budget
+    finally:
+        stop(stubborn)
+        stubborn.stdout.close()
 
 
 def test_stop_failure_still_deletes_plaintext_and_reports_cleanup_failure(tmp_path: Path, monkeypatch):
@@ -451,6 +704,7 @@ def test_closed_context_cannot_be_reused_to_leave_yaml_behind(tmp_path: Path):
 
 
 def test_f1_public_boundary_cannot_be_tricked_into_pass():
+    assert PROBE_GATE_OPEN is False  # the single switch; F3 flips it with route-proof tests
     for unproven in ("PASS", "PARTIAL", "CONFLICT"):
         sentinel = fake_secret()
         output = redacted_result_dict({

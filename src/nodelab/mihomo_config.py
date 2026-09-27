@@ -9,6 +9,7 @@ synthetic safety tests; it is not authority to probe a real node.
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 import os
 import re
@@ -24,7 +25,10 @@ from typing import Any
 
 import yaml
 
-from nodelab.mihomo_process import MihomoProcess, ProcessLifecycleError, stop_owned_process
+from nodelab.mihomo_process import (
+    MihomoProcess, ProcessIdentity, ProcessLifecycleError, process_identity,
+    stop_owned_process, terminate_verified_process,
+)
 
 PROBE_GROUP = "PROBE"
 DELAY_URL = "https://www.gstatic.com/generate_204"
@@ -33,6 +37,11 @@ _PRIVATE_CODES = frozenset({
     "SECRET_CLEANUP_FAILED", "PROBE_GATE_CLOSED", "PROCESS_START_FAILED",
 })
 _WINDOWS_ROOT = Path(r"E:\NodeLab.secrets\_runtime")
+_RUN_ID = re.compile(r"[0-9a-f]{32}\Z")
+_LOCK_SUFFIX = ".lock"
+_RECOVER_LOCK = ".recover" + _LOCK_SUFFIX
+_MARKER = ".owner.json"
+_MARKER_MAX_BYTES = 4096
 _ACL_CHECK_SCRIPT = r"""
 $ErrorActionPreference = 'Stop'
 $target = [Environment]::GetEnvironmentVariable('NODELAB_PRIVATE_PATH', 'Process')
@@ -182,12 +191,154 @@ def _check_clean_private_tree(path: Path) -> None:
             pending.extend(current.iterdir())
 
 
+def _acquire_lock(path: Path) -> int:
+    """Create `path` exclusively and hold an OS lock on it for this process.
+
+    The OS releases the lock when the owning process dies for any reason,
+    so liveness never depends on a (reusable) PID.  Windows additionally
+    uses delete-on-close, so a dead owner leaves no lock file at all.
+    Children never inherit the descriptor/handle.
+    """
+    if os.name == "nt":
+        import msvcrt
+
+        fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOINHERIT | os.O_TEMPORARY, 0o600)
+        try:
+            msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+        except OSError:
+            os.close(fd)
+            raise
+        return fd
+    import fcntl
+
+    fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        os.close(fd)
+        raise
+    return fd
+
+
+def _release_lock(path: Path, fd: int | None) -> None:
+    if fd is None:
+        return
+    if os.name == "nt":
+        import msvcrt
+
+        try:
+            msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+        except OSError:
+            pass
+        os.close(fd)  # O_TEMPORARY removes the file with the last handle
+        return
+    try:
+        path.unlink()  # unlink first: nobody can newly open a lock we are dropping
+    except OSError:
+        pass
+    os.close(fd)  # flock is released with the descriptor
+
+
+def _lock_state(path: Path) -> str:
+    """'live' (held by a running process), 'stale' (nobody holds it), 'missing' or 'unsafe'."""
+    try:
+        if _is_reparse(path):
+            return "unsafe"
+    except FileNotFoundError:
+        return "missing"
+    except OSError:
+        return "unsafe"
+    if os.name == "nt":
+        import msvcrt
+
+        try:
+            fd = os.open(path, os.O_RDWR | os.O_NOINHERIT)
+        except PermissionError:
+            return "live"  # sharing violation: a delete-on-close handle is open elsewhere
+        except FileNotFoundError:
+            return "missing"
+        except OSError:
+            return "unsafe"
+        try:
+            try:
+                msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+            except OSError:
+                return "live"
+            try:
+                msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+            except OSError:
+                pass
+            return "stale"
+        finally:
+            os.close(fd)
+    import fcntl
+
+    try:
+        fd = os.open(path, os.O_RDWR | os.O_CLOEXEC | os.O_NOFOLLOW)
+    except FileNotFoundError:
+        return "missing"
+    except OSError:
+        return "unsafe"
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            return "live"
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        return "stale"
+    finally:
+        os.close(fd)
+
+
+def _dir_fingerprint(path: Path) -> str:
+    canonical = os.path.normcase(str(path.resolve(strict=False)))
+    return hashlib.sha256(canonical.encode("utf-8", errors="surrogatepass")).hexdigest()[:32]
+
+
+def _classify_root_entries(root: Path) -> tuple[int, list[Path]]:
+    """Return (live run count, entries that need recovery/review).
+
+    A live run is a `<run_id>` directory (or a lock alone, i.e. a run that is
+    still being created/removed) whose `<run_id>.lock` is held by a running
+    process.  Everything else -- stale runs, lone stale locks, unknown names,
+    files, reparse points, a recovery in progress -- is reported.
+    """
+    live = 0
+    review: list[Path] = []
+    seen_ids: set[str] = set()
+    for entry in sorted(root.iterdir()):
+        name = entry.name
+        if name == _RECOVER_LOCK:
+            review.append(entry)  # recovery running (live) or crashed (stale): wait/recover
+            continue
+        run_id = name[:-len(_LOCK_SUFFIX)] if name.endswith(_LOCK_SUFFIX) else name
+        if not _RUN_ID.fullmatch(run_id) or run_id in seen_ids:
+            if not _RUN_ID.fullmatch(run_id):
+                review.append(entry)
+            continue
+        seen_ids.add(run_id)
+        run_dir = root / run_id
+        lock = root / (run_id + _LOCK_SUFFIX)
+        state = _lock_state(lock)
+        if state == "live":
+            live += 1
+            continue
+        if run_dir.exists() or run_dir.is_symlink():
+            review.append(run_dir)
+        if state != "missing":
+            review.append(lock)
+    return live, review
+
+
 class RunContext:
     """Single owner for one private YAML and one exact Popen object.
 
-    Stale entries in its dedicated root block future runs and require Owner
-    review; an unverified PID is never killed. This is safer than global
-    process-name cleanup and honest about OS-crash limitations.
+    Concurrent live runs coexist under one root: each holds an OS lock that
+    dies with its process.  Residue whose lock nobody holds is a crashed run;
+    it blocks new runs (`RECOVERY_REVIEW_REQUIRED`) until the explicit
+    `recover_stale_runs()` step verifies ownership, stops only an
+    identity-verified child and deletes the plaintext.  Nothing is ever
+    matched by process name, and an unverified PID is never signalled.
     """
 
     def __init__(self, root: Path | None = None) -> None:
@@ -196,13 +347,15 @@ class RunContext:
             if self.root != _WINDOWS_ROOT:
                 raise PrivateRunError()
         else:
-            self.root = Path(root) if root is not None else Path(tempfile.gettempdir()) / ("nodelab-private-" + secrets.token_hex(16))
+            self.root = Path(root) if root is not None else _default_posix_root()
         self.run_dir: Path | None = None
         self.run_id: str | None = None
         self.process: MihomoProcess | None = None
         self.raw_child: subprocess.Popen | None = None
         self._windows_owner_sid: str | None = None
         self._private_tree_removed = False
+        self._lock_path: Path | None = None
+        self._lock_fd: int | None = None
         self.active = False
         self.closed = False
 
@@ -226,8 +379,10 @@ class RunContext:
             else:
                 self.root.mkdir(mode=0o700)  # intentionally no parents=True
                 _verify_posix(self.root, directory=True)
-        if any(self.root.iterdir()):
-            # A crash cannot run finally; unverified remnants require review.
+        _live, review = _classify_root_entries(self.root)
+        if review:
+            # A crash cannot run finally; unverified remnants require the
+            # explicit recovery step.  Live concurrent runs do not block.
             raise PrivateRunError("RECOVERY_REVIEW_REQUIRED")
 
     def _verify(self, path: Path, *, directory: bool) -> None:
@@ -251,15 +406,25 @@ class RunContext:
             self._verify(path, directory=False)
         return path
 
-    def _write_marker(self, *, child_pid: int | None = None) -> None:
+    def _write_marker(self, *, child: ProcessIdentity | None = None) -> None:
         assert self.run_dir is not None and self.run_id is not None
-        marker = self.run_dir / ".owner.json"
+        marker = self.run_dir / _MARKER
         if not marker.exists():
-            self._new_file(".owner.json")
+            self._new_file(_MARKER)
         self._verify(marker, directory=False)
-        # No credentials, URI, hostname, EXE path, or controller token here.
-        value = {"run_id": self.run_id, "owner_pid": os.getpid(),
-                 "created_at_epoch": int(time.time()), "child_pid": child_pid}
+        owner = process_identity(os.getpid())
+        # No credentials, URI, hostname, EXE path, or controller token here:
+        # only what recovery needs to prove "same process" and "same dir".
+        value = {
+            "run_id": self.run_id, "created_at_epoch": int(time.time()),
+            "run_dir_fingerprint": _dir_fingerprint(self.run_dir),
+            "owner_pid": os.getpid(),
+            "owner_create_time": owner.create_time if owner else None,
+            "owner_exe_fingerprint": owner.exe_fingerprint if owner else None,
+            "child_pid": child.pid if child else None,
+            "child_create_time": child.create_time if child else None,
+            "child_exe_fingerprint": child.exe_fingerprint if child else None,
+        }
         with marker.open("w", encoding="utf-8") as f:
             json.dump(value, f, sort_keys=True)
 
@@ -269,6 +434,10 @@ class RunContext:
         try:
             self._ensure_root()
             self.run_id = secrets.token_hex(16)
+            # Lock first, then mkdir: a concurrent scanner therefore never
+            # sees a run directory whose lock is not yet held.
+            self._lock_path = self.root / (self.run_id + _LOCK_SUFFIX)
+            self._lock_fd = _acquire_lock(self._lock_path)
             self.run_dir = self.root / self.run_id
             self.run_dir.mkdir(mode=0o700)
             if os.name == "nt":
@@ -293,14 +462,30 @@ class RunContext:
                     shutil.rmtree(self.run_dir)
             except OSError:
                 pass
+        self._drop_lock()
         self.active = False
 
+    def _drop_lock(self) -> None:
+        if self._lock_fd is not None and self._lock_path is not None:
+            _release_lock(self._lock_path, self._lock_fd)
+        self._lock_fd = None
+
     def write_yaml(self, value: dict[str, Any]) -> Path:
-        """Exclusive empty file, read-back ACL, then write private YAML."""
+        """Exclusive empty file, read-back ACL, then write private YAML.
+
+        The same run may rewrite its own probe.yaml (e.g. one retry per port
+        attempt, contract F.4); the existing file is re-verified as ours and
+        truncated, never followed through a link.
+        """
         if not self.active or self.run_dir is None or not isinstance(value, dict):
             raise PrivateRunError()
         try:
-            path = self._new_file("probe.yaml")
+            path = self.run_dir / "probe.yaml"
+            if path.exists() or path.is_symlink():
+                if _is_reparse(path):
+                    raise PrivateRunError()
+            else:
+                path = self._new_file("probe.yaml")
             self._verify(path, directory=False)
             text = yaml.safe_dump(value, allow_unicode=True, sort_keys=False)
             with path.open("w", encoding="utf-8") as f:
@@ -330,7 +515,7 @@ class RunContext:
             )
             self.raw_child = proc  # retain ownership even if wrapper/marker raises
             self.process = MihomoProcess(proc)
-            self._write_marker(child_pid=proc.pid)
+            self._write_marker(child=process_identity(proc.pid))
             return proc
         except PrivateRunError:
             raise
@@ -383,13 +568,171 @@ class RunContext:
         removed = self._remove_private_tree()
         if not (stopped and removed):
             # Never report a prior success if process/file cleanup is unknown.
+            # The lock stays held: the residue is still owned, not stale.
             raise PrivateRunError("SECRET_CLEANUP_FAILED")
+        self._drop_lock()
         self.closed = True
         self.active = False
 
     def __exit__(self, _exc_type: object, _exc: object, _tb: object) -> bool:
         self.close()
         return False
+
+
+def _default_posix_root() -> Path:
+    # Stable per-user root so that crash residue is found again; a foreign
+    # directory of the same name fails the uid/mode check, never gets used.
+    return Path(tempfile.gettempdir()) / f"nodelab-private-{os.getuid()}"
+
+
+def _recovery_row(number: int, code: str | None) -> dict[str, Any]:
+    return {"line_number": number, "probe_status": None, "stage": "CLEANUP", "error_code": code}
+
+
+class _Recovery:
+    """Verified recovery of ONE private root; see recover_stale_runs()."""
+
+    def __init__(self, root: Path) -> None:
+        self.root = root
+        self.sid: str | None = None
+
+    def verify(self, path: Path, *, directory: bool) -> None:
+        if os.name == "nt":
+            if self.sid is None:
+                self.sid = _windows_sid()
+            _verify_windows_acl(path, self.sid)
+        else:
+            _verify_posix(path, directory=directory)
+
+    def read_marker(self, run_dir: Path) -> dict[str, Any] | None:
+        marker = run_dir / _MARKER
+        if not marker.is_file() or _is_reparse(marker) or marker.stat().st_size > _MARKER_MAX_BYTES:
+            return None
+        self.verify(marker, directory=False)
+        data = json.loads(marker.read_text(encoding="utf-8"))
+        if not isinstance(data, dict) or data.get("run_id") != run_dir.name:
+            return None
+        if data.get("run_dir_fingerprint") != _dir_fingerprint(run_dir):
+            return None
+        for key in ("owner_pid", "child_pid", "owner_create_time", "child_create_time"):
+            if data.get(key) is not None and type(data.get(key)) is not int:
+                return None
+        for key in ("owner_exe_fingerprint", "child_exe_fingerprint"):
+            if data.get(key) is not None and type(data.get(key)) is not str:
+                return None
+        return data
+
+    def recover_dir(self, run_dir: Path) -> str | None:
+        """Return None when fully recovered, else the fixed code."""
+        if _is_reparse(run_dir) or not run_dir.is_dir():
+            return "RECOVERY_REVIEW_REQUIRED"
+        self.verify(run_dir, directory=True)
+        entries = {entry.name for entry in run_dir.iterdir()}
+        if not entries <= {_MARKER, "probe.yaml"}:
+            return "RECOVERY_REVIEW_REQUIRED"  # not a tree this application creates
+        marker = self.read_marker(run_dir) if _MARKER in entries else None
+        if marker is None and _MARKER in entries:
+            return "RECOVERY_REVIEW_REQUIRED"
+        stop_failed = False
+        if marker is not None:
+            owner_pid, owner_stamp = marker.get("owner_pid"), marker.get("owner_create_time")
+            if owner_pid is not None and owner_stamp is not None:
+                owner = ProcessIdentity(owner_pid, owner_stamp, marker.get("owner_exe_fingerprint"))
+                if owner.matches(process_identity(owner_pid)):
+                    return "RECOVERY_REVIEW_REQUIRED"  # owner alive without its lock: never touch
+            child_pid, child_stamp = marker.get("child_pid"), marker.get("child_create_time")
+            if child_pid is not None and child_stamp is not None:
+                child = ProcessIdentity(child_pid, child_stamp, marker.get("child_exe_fingerprint"))
+                stop_failed = not terminate_verified_process(child)
+            elif child_pid is not None:
+                stop_failed = True  # child recorded but unverifiable: report, never kill
+        _check_clean_private_tree(run_dir)
+        shutil.rmtree(run_dir)
+        if run_dir.exists() or run_dir.is_symlink():
+            return "SECRET_CLEANUP_FAILED"
+        return "PROCESS_STOP_FAILED" if stop_failed else None
+
+    @staticmethod
+    def _remove_stale_lock(lock: Path) -> str | None:
+        state = _lock_state(lock)
+        if state in {"missing", "live"}:
+            return None  # nothing left, or (re)acquired by a live run meanwhile
+        if state != "stale":
+            return "RECOVERY_REVIEW_REQUIRED"
+        lock.unlink()
+        return None
+
+    def run(self) -> list[dict[str, Any]]:
+        rows: list[dict[str, Any]] = []
+        _live, review = _classify_root_entries(self.root)
+        for entry in review:
+            number = len(rows) + 1
+            if entry.name == _RECOVER_LOCK:
+                continue  # our own recovery lock
+            try:
+                if entry.name.endswith(_LOCK_SUFFIX):
+                    if (self.root / entry.name[:-len(_LOCK_SUFFIX)]) in review:
+                        continue  # already handled together with its run directory
+                    state = _lock_state(entry)  # a lock without a directory
+                    if state == "live":
+                        continue  # a run started meanwhile; it is not residue
+                    if state == "stale":
+                        entry.unlink()
+                    if state in {"stale", "missing"}:
+                        rows.append(_recovery_row(number, None))
+                    else:
+                        rows.append(_recovery_row(number, "RECOVERY_REVIEW_REQUIRED"))
+                    continue
+                if not _RUN_ID.fullmatch(entry.name):
+                    rows.append(_recovery_row(number, "RECOVERY_REVIEW_REQUIRED"))
+                    continue
+                code = self.recover_dir(entry)
+                if code is None or code == "PROCESS_STOP_FAILED":
+                    lock_code = self._remove_stale_lock(self.root / (entry.name + _LOCK_SUFFIX))
+                    code = code or lock_code
+                rows.append(_recovery_row(number, code))
+            except (OSError, ValueError, PrivateRunError, ProcessLifecycleError):
+                rows.append(_recovery_row(number, "SECRET_CLEANUP_FAILED"))
+        return rows
+
+
+def recover_stale_runs(root: Path | None = None) -> list[dict[str, Any]]:
+    """Explicit crash recovery for the private root (CLI: `nodelab recover --confirm`).
+
+    Only directories this application created (run-id name, verified ACL/
+    mode, marker naming this very directory) are touched.  A recorded child
+    is terminated only while its pid, creation stamp and executable digest
+    still match the marker; anything unverifiable is reported as
+    RECOVERY_REVIEW_REQUIRED and left alone.  Live runs are skipped.
+    Returns one fixed-shape row per handled entry (no paths, no ids).
+    """
+    probe = RunContext(root)  # applies the same root rules, never enters
+    root_path = probe.root
+    if not root_path.exists() and not root_path.is_symlink():
+        return []
+    recovery = _Recovery(root_path)
+    if os.name == "nt":
+        if not _windows_volume_ok(root_path):
+            raise PrivateRunError()
+        recovery.sid = _windows_sid()
+        for path in (root_path.parent, root_path):
+            _verify_windows_acl(path, recovery.sid)
+    else:
+        _verify_posix(root_path, directory=True)
+    lock_path = root_path / _RECOVER_LOCK
+    try:
+        fd = _acquire_lock(lock_path)
+    except FileExistsError:
+        if _lock_state(lock_path) != "stale":
+            raise PrivateRunError("RECOVERY_REVIEW_REQUIRED") from None  # another recovery is running
+        lock_path.unlink()
+        fd = _acquire_lock(lock_path)
+    except OSError:
+        raise PrivateRunError("RECOVERY_REVIEW_REQUIRED") from None
+    try:
+        return recovery.run()
+    finally:
+        _release_lock(lock_path, fd)
 
 
 def build_mihomo_yaml(*_args: Any, **_kwargs: Any) -> None:
