@@ -10,6 +10,7 @@ a real node.
 from __future__ import annotations
 
 import base64
+import errno
 import hashlib
 import json
 import os
@@ -336,10 +337,20 @@ def _release_lock(path: Path, fd: int | None) -> None:
     os.close(fd)  # flock is released with the descriptor
 
 
+
+def _linux_lock_metadata(info: os.stat_result) -> bool:
+    """Only this application's empty, private, single-link regular locks."""
+    return (stat.S_ISREG(info.st_mode) and info.st_uid == os.getuid()
+            and stat.S_IMODE(info.st_mode) == 0o600 and info.st_nlink == 1
+            and info.st_size == 0)
+
+
 def _lock_state(path: Path) -> str:
     """'live' (held by a running process), 'stale' (nobody holds it), 'missing' or 'unsafe'."""
     try:
         if _is_reparse(path):
+            return "unsafe"
+        if sys.platform == "linux" and not _linux_lock_metadata(path.lstat()):
             return "unsafe"
     except FileNotFoundError:
         return "missing"
@@ -370,18 +381,34 @@ def _lock_state(path: Path) -> str:
             os.close(fd)
     import fcntl
 
+    flags = os.O_RDWR | os.O_CLOEXEC | os.O_NOFOLLOW
+    if sys.platform == "linux":
+        flags |= os.O_NONBLOCK
     try:
-        fd = os.open(path, os.O_RDWR | os.O_CLOEXEC | os.O_NOFOLLOW)
+        fd = os.open(path, flags)
     except FileNotFoundError:
         return "missing"
     except OSError:
         return "unsafe"
     try:
+        if sys.platform == "linux":
+            try:
+                if not _linux_lock_metadata(os.fstat(fd)):
+                    return "unsafe"
+            except OSError:
+                return "unsafe"
         try:
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as error:
+            if sys.platform != "linux" or error.errno in {errno.EAGAIN, errno.EWOULDBLOCK}:
+                return "live"
+            return "unsafe"
+        try:
+            fcntl.flock(fd, fcntl.LOCK_UN)
         except OSError:
-            return "live"
-        fcntl.flock(fd, fcntl.LOCK_UN)
+            if sys.platform != "linux":
+                raise
+            return "unsafe"
         return "stale"
     finally:
         os.close(fd)
@@ -1003,6 +1030,12 @@ class _Recovery:
                         rows.append(_recovery_row(number, "RECOVERY_REVIEW_REQUIRED"))
                     continue
                 if not _RUN_ID.fullmatch(entry.name):
+                    rows.append(_recovery_row(number, "RECOVERY_REVIEW_REQUIRED"))
+                    continue
+                if (sys.platform == "linux" and
+                        _lock_state(self.root / (entry.name + _LOCK_SUFFIX)) not in {"missing", "stale"}):
+                    # Classification is not an ownership grant. Unsafe or
+                    # newly held locks must not authorize process/file actions.
                     rows.append(_recovery_row(number, "RECOVERY_REVIEW_REQUIRED"))
                     continue
                 code = self.recover_dir(entry)

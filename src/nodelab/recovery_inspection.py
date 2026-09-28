@@ -4,7 +4,6 @@ from __future__ import annotations
 import itertools
 import os
 from pathlib import Path
-import stat
 import sys
 
 from nodelab import mihomo_config as private
@@ -30,8 +29,7 @@ def _lock_description(path: Path) -> str:
         return "ABSENT"
     except OSError:
         return "UNSAFE"
-    if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid()
-            or stat.S_IMODE(info.st_mode) != 0o600 or info.st_nlink != 1):
+    if not private._linux_lock_metadata(info):
         return "UNSAFE"
     return "PRESENT_UNCHECKED"
 
