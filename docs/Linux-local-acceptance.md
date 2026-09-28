@@ -51,15 +51,18 @@ tools/runtime/acceptance/bin/python scripts/f2_session_gate.py \
   --suite trojan-tcp --exe "$PWD/tools/mihomo/mihomo"
 tools/runtime/acceptance/bin/python scripts/f2_session_gate.py \
   --suite vless-tcp --exe "$PWD/tools/mihomo/mihomo"
+tools/runtime/acceptance/bin/python scripts/f2_session_gate.py \
+  --suite full --exe "$PWD/tools/mihomo/mihomo"
 ```
 
 - `session`：精确 11 个用例通过且零 skip；合成会话范围，不是实际代理协议证明。
 - `trojan-tcp`：精确 4 个用例通过且零 skip；实际本机 Trojan/TLS/TCP。
 - `vless-tcp`：精确 4 个用例通过且零 skip；实际本机 VLESS v0/零 addons/TLS/TCP。
+- `full`：当前精确 688 个 testcase，要求 685 passed，只允许三个指定 Windows 测试以 pytest.skip 跳过；不是任意三个 skip。失败诊断仅发布源码白名单中的测试函数标识，不包含参数或异常文本。增减测试时须审阅并更新 `FULL_EXPECTED_CASES`。
 - 所有 gate 都要求固定二进制校验；不会接受环境变量提供的自定义摘要作为验收替代。
 - 即使协议 gate 通过，范围也仅为 `LOCAL_FIXTURE_ONLY`；不覆盖外部节点、Vision/WS/gRPC/Reality、Windows 或普通短请求的采样可靠性。
 
-最新远端执行状态见审计 021：三套 gate 已在 GitHub 托管 Linux runner 通过，分别为 11/4/4 个通过且零 skip。当前沙箱本身仍缺少受支持 Python 和可用官方二进制；不要混淆本地与远端结果。
+最新远端执行状态见审计 022：完整 Linux 回归为 685 passed、3 个指定 Windows skip；三套独立 gate 为 11/4/4 个通过且零 skip。当前沙箱本身仍缺少受支持 Python 和可用官方二进制；不要混淆本地与远端结果。
 
 ## 4. 可选：显式启用 GitHub Actions 验收
 
@@ -68,9 +71,9 @@ tools/runtime/acceptance/bin/python scripts/f2_session_gate.py \
 - 提供 `workflow_dispatch`，以及标签启用的 `pull_request` 入口。PR 必须来自同仓库、目标为 main、带有 `run-local-acceptance` 标签；只响应 labeled/synchronize/reopened。没有 push/schedule 或 `pull_request_target`，也没有节点、凭据或下载 URL 输入。
 - 标签代表允许在该 PR 的后续提交上持续运行本机验收；移除标签后，后续事件不再运行此 job。移除标签不会取消已经启动的任务。Fork PR 即使带标签也不会运行此 job。
 - GitHub 托管 Ubuntu 24.04 runner，Python 3.12；官方 actions 固定到完整 commit SHA，仓库权限只读，checkout 不持久化 token。
-- 下载固定官方资源，调用同一个双摘要离线准备脚本，再分别执行 session、Trojan TCP、VLESS TCP gate。
+- 下载固定官方资源，调用同一个双摘要离线准备脚本，再分别执行 session、Trojan TCP、VLESS TCP 与 full gate。
 - 任一 gate 的非零退出码都会使 job 失败；使用 bash pipefail，不让 `tee` 隐藏失败。准备成功后，即使前一套 gate 失败，也继续运行其余独立 gate。
-- 仅上传 `preparation.json`、`session.json`、`trojan-tcp.json`、`vless-tcp.json`，保留 7 天；不上传原始 pytest/引擎日志、配置、证书、二进制、Junit XML 或运行目录。
+- 仅上传 `preparation.json`、`session.json`、`trojan-tcp.json`、`vless-tcp.json`、`full.json`，保留 7 天；不上传原始 pytest/引擎日志、配置、证书、二进制、Junit XML 或运行目录。
 - 固定 20 分钟 job 上限。取消/超时不是通过或清理完成证据，不能替代进程回收验收；不自动取消同分支正在运行的任务。
 - 项目/pytest 依赖按当前项目约束安装，尚非全依赖锁定的可重复构建。网络下载、托管 runner 和 actions 自身也可能失败，workflow 配置存在不保证执行成功。
 
@@ -108,3 +111,9 @@ PR #2 的标签入口已经实际触发：[run 36399985871](https://github.com/w
 当前沙箱无法下载 Actions blob 附件，因此工作流新增同一份固定字段 JSON 的 check notices；可通过 `gh api repos/wpuu/NodeLab/check-runs/108863525420/annotations` 读取。不会发布原始引擎日志或测试凭据。审计 021 记录证据和限制。
 
 本轮已移除 opt-in 标签，避免文档更新重复触发；后续代码验收仍可重新添加。无需为此次本机验收调整支出预算。公共仓库运行成功不等于账户账单状态全面正常，也不等于所有平台或生产探测通过。
+
+### 最新补充：受支持 Python 上的全量回归
+
+[run 36403873841](https://github.com/wpuu/NodeLab/actions/runs/36403873841)，head `1325490ce9ae1212b6b7bb8647a575d837af89c4`：`LINUX_FULL_REGRESSION / PASS / FULL_REGRESSION_OK`，**685 passed、3 skipped**。三个 skip 身份已由 gate 严格核对为 Windows 专属测试。session/Trojan/VLESS 也再次通过。结果通过 check `108868158025` 的 annotations API 读回核实。
+
+具体证据、统计边界和限制见审计 022。full 覆盖已有独立 gate 的用例，不把重复执行计为更多独立用例。opt-in 标签已在完成验收后移除；后续代码变更仍需重新验收。
