@@ -345,6 +345,47 @@ def _linux_lock_metadata(info: os.stat_result) -> bool:
             and info.st_size == 0)
 
 
+
+def _linux_recovery_lock_matches(path: Path, fd: int) -> bool:
+    held, named = os.fstat(fd), path.lstat()
+    return (_linux_lock_metadata(held) and _linux_lock_metadata(named)
+            and (held.st_dev, held.st_ino) == (named.st_dev, named.st_ino))
+
+
+def _acquire_linux_recovery_lock(path: Path) -> int:
+    """Take an existing stale inode directly; never unlink before acquiring.
+
+    An opener that raced the previous holder's unlink may own an unlinked old
+    inode. Revalidate AFTER flock, before granting access to recovery actions.
+    """
+    import fcntl
+
+    fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600)
+    try:
+        if not _linux_lock_metadata(os.fstat(fd)):
+            raise PrivateRunError("RECOVERY_REVIEW_REQUIRED")
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        if not _linux_recovery_lock_matches(path, fd):
+            raise PrivateRunError("RECOVERY_REVIEW_REQUIRED")
+        return fd
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+def _release_linux_recovery_lock(path: Path, fd: int) -> None:
+    try:
+        # Do not knowingly unlink a replacement lock. This check/unlink pair
+        # is not an atomic defence against a hostile same-identity writer.
+        if not _linux_recovery_lock_matches(path, fd):
+            raise PrivateRunError("RECOVERY_REVIEW_REQUIRED")
+        path.unlink()
+    except (OSError, ValueError):
+        raise PrivateRunError("RECOVERY_REVIEW_REQUIRED") from None
+    finally:
+        os.close(fd)
+
+
 def _lock_state(path: Path) -> str:
     """'live' (held by a running process), 'stale' (nobody holds it), 'missing' or 'unsafe'."""
     try:
@@ -1074,6 +1115,15 @@ def recover_stale_runs(root: Path | None = None) -> list[dict[str, Any]]:
     else:
         _verify_posix(root_path, directory=True)
     lock_path = root_path / _RECOVER_LOCK
+    if sys.platform == "linux":
+        try:
+            fd = _acquire_linux_recovery_lock(lock_path)
+        except (OSError, ValueError, PrivateRunError):
+            raise PrivateRunError("RECOVERY_REVIEW_REQUIRED") from None
+        try:
+            return recovery.run()
+        finally:
+            _release_linux_recovery_lock(lock_path, fd)
     try:
         fd = _acquire_lock(lock_path)
     except FileExistsError:
