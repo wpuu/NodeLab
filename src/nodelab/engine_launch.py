@@ -26,6 +26,7 @@ real launch leaves NO extra files in the run directory when
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 import socket
@@ -147,6 +148,29 @@ def _controller_status(base: str, path: str, token: str | None, *, deadline: flo
         return None
 
 
+def _controller_object(pairs):
+    # json.loads normally keeps the last duplicate key. Never allow one
+    # routing/auth/evidence field to silently overwrite another, at any depth.
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("CONTROLLER_JSON_INVALID")
+        result[key] = value
+    return result
+
+
+def _controller_bad_number(value):
+    raise ValueError("CONTROLLER_JSON_INVALID")
+
+
+def _controller_float(value):
+    number = float(value)
+    # parse_constant alone does not catch valid JSON exponent overflow.
+    if not math.isfinite(number):
+        raise ValueError("CONTROLLER_JSON_INVALID")
+    return number
+
+
 def _controller_json(base: str, path: str, token: str, *, deadline: float | None = None) -> Any:
     request = urllib.request.Request(base + path)
     request.add_header("Authorization", "Bearer " + token)
@@ -164,7 +188,10 @@ def _controller_json(base: str, path: str, token: str, *, deadline: float | None
                 data.extend(chunk)
                 if len(data) > 1024 * 1024:
                     return None
-            return json.loads(data.decode("utf-8", "strict"))
+            return json.loads(data.decode("utf-8", "strict"),
+                              object_pairs_hook=_controller_object,
+                              parse_constant=_controller_bad_number,
+                              parse_float=_controller_float)
     except DeadlineExpired:
         raise
     except urllib.error.HTTPError as error:

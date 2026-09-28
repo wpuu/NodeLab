@@ -11,7 +11,7 @@ from nodelab import engine_launch as launch
 
 
 @contextmanager
-def server(status=200, location=None):
+def server(status=200, location=None, body=b'{"ok": true}'):
     received = []
 
     class Handler(BaseHTTPRequestHandler):
@@ -21,7 +21,7 @@ def server(status=200, location=None):
             if location:
                 self.send_header("Location", location)
             self.end_headers()
-            self.wfile.write(b'{"ok": true}')
+            self.wfile.write(body)
 
         def log_message(self, *args):
             pass
@@ -133,3 +133,55 @@ def test_verified_controller_precedes_auth_and_data_listener(monkeypatch, tmp_pa
 def test_json_requires_http_200_even_if_body_is_valid(status):
     with server(status) as (base, _):
         assert launch._controller_json(base, "/connections", secrets.token_urlsafe(32)) is None
+
+
+@pytest.mark.parametrize("body", [
+    b'{"mode":"direct","mode":"rule"}',
+    b'{"mode":"rule","mode":"direct"}',
+    b'{"connections":[],"connections":null}',
+    b'{"connections":[{"chains":["DIRECT"],"chains":["NODE","PROBE"]}]}',
+    b'{"proxies":{"PROBE":{"now":"DIRECT","now":"NODE"}}}',
+    b'{"rules":[{"proxy":"DIRECT","proxy":"PROBE"}]}',
+    b'{"mode":"direct","\\u006dode":"rule"}',
+    b'{"mode":"rule","mode":"rule"}',
+    b'{"connections":null,"extra":NaN}',
+    b'{"connections":null,"extra":Infinity}',
+    b'{"connections":null,"extra":-Infinity}',
+    b'{"connections":null,"extra":1e400}',
+    b'{"connections":null,"extra":-1e400}',
+])
+def test_controller_json_rejects_ambiguous_keys_and_nonfinite_numbers(monkeypatch, body):
+    import io
+    response = io.BytesIO(body)
+    response.status = 200
+    monkeypatch.setattr(launch, "_controller_open", lambda *a, **k: response)
+    assert launch._controller_json("http://127.0.0.1:12002", "/connections", secrets.token_urlsafe(32)) is None
+    assert response.closed
+
+
+@pytest.mark.parametrize("body,expected", [
+    (b'{"connections":null}', {"connections": None}),
+    (b'{"first":{"mode":"rule"},"second":{"mode":"rule"}}',
+     {"first": {"mode": "rule"}, "second": {"mode": "rule"}}),
+    (b'{"counter":18446744073709551615,"rate":1.25e2,"note":"NaN Infinity"}',
+     {"counter": 18446744073709551615, "rate": 125.0, "note": "NaN Infinity"}),
+])
+def test_controller_strict_json_preserves_valid_values(monkeypatch, body, expected):
+    import io
+    response = io.BytesIO(body)
+    response.status = 200
+    monkeypatch.setattr(launch, "_controller_open", lambda *a, **k: response)
+    assert launch._controller_json("http://127.0.0.1:12002", "/connections", secrets.token_urlsafe(32)) == expected
+    assert response.closed
+
+
+@pytest.mark.parametrize("body,expected", [
+    (b'{"connections":[],"connections":null}', None),
+    (b'{"connections":null,"extra":NaN}', None),
+    (b'{"connections":null}', {"connections": None}),
+])
+def test_controller_strict_json_over_actual_loopback_http(body, expected):
+    token = secrets.token_urlsafe(32)
+    with server(body=body) as (base, received):
+        assert launch._controller_json(base, "/connections", token) == expected
+        assert received == ["Bearer " + token]
