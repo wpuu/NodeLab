@@ -279,9 +279,21 @@ def test_s8_popen_failure_still_deletes_yaml(tmp_path: Path, monkeypatch):
         with ctx:
             ctx.write_yaml({"password": sentinel})
             ctx.spawn_synthetic_process()
-    assert info.value.code == "PROCESS_START_FAILED"
-    assert sentinel not in str(info.value)
-    assert not ctx.run_dir.exists()
+    try:
+        code = "SECRET_CLEANUP_FAILED" if sys.platform == "linux" else "PROCESS_START_FAILED"
+        assert info.value.code == code
+        assert sentinel not in str(info.value)
+        assert not (ctx.run_dir / "probe.yaml").exists()
+        if sys.platform == "linux":
+            assert (ctx.run_dir / ".owner-launch.tmp").is_file()
+            assert not ctx.closed and ctx.raw_child is None
+        else:
+            assert not ctx.run_dir.exists()
+    finally:
+        # The injected launcher never creates a child; only fixture teardown
+        # may clear this uncertainty. Real constructor exceptions may not.
+        ctx._launch_unclaimed = False
+        ctx.close()
 
 
 def test_s8_after_popen_wrapper_error_still_owns_exact_child(tmp_path: Path, monkeypatch):

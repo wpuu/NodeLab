@@ -43,6 +43,7 @@ _RUN_ID = re.compile(r"[0-9a-f]{32}\Z")
 _LOCK_SUFFIX = ".lock"
 _RECOVER_LOCK = ".recover" + _LOCK_SUFFIX
 _MARKER = ".owner.json"
+_LAUNCH_PENDING = ".owner-launch.tmp"
 _MARKER_MAX_BYTES = 4096
 _LINUX_BOOT_ID = Path("/proc/sys/kernel/random/boot_id")
 _BOOT_FINGERPRINT = re.compile(r"[0-9a-f]{64}\Z")
@@ -450,6 +451,7 @@ class RunContext:
         self._windows_owner_sid: str | None = None
         self._linux_boot: str | None = None
         self._private_tree_removed = False
+        self._launch_unclaimed = False
         self._lock_path: Path | None = None
         self._lock_fd: int | None = None
         self.active = False
@@ -622,7 +624,7 @@ class RunContext:
         truncated, never followed through a link.
         """
         if (not self.active or self.run_dir is None or not isinstance(value, dict)
-                or self.raw_child is not None):
+                or self.raw_child is not None or self._launch_unclaimed):
             raise PrivateRunError()
         try:
             path = self.run_dir / "probe.yaml"
@@ -644,6 +646,39 @@ class RunContext:
             # PyYAML/custom mapping errors may themselves contain a secret.
             raise PrivateRunError("CONFIG_BUILD_FAILED") from None
 
+    def _sync_run_directory(self) -> None:
+        fd = os.open(self.run_dir, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+
+    def _begin_linux_launch(self) -> None:
+        if sys.platform != "linux":
+            return
+        self._verify(self.run_dir, directory=True)
+        pending = self.run_dir / _LAUNCH_PENDING
+        fd = os.open(pending, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+        try:
+            stream = os.fdopen(fd, "w", encoding="utf-8")
+            fd = None
+            with stream:
+                self._verify(pending, directory=False)
+                stream.write('{"state":"launch_pending"}\n')
+                stream.flush()
+                os.fsync(stream.fileno())
+            self._sync_run_directory()
+        finally:
+            if fd is not None:
+                os.close(fd)
+
+    def _complete_linux_launch(self) -> None:
+        if sys.platform == "linux":
+            # Only after the child marker has been fully published. If this
+            # fails, the exact Popen is still owned for normal cleanup.
+            (self.run_dir / _LAUNCH_PENDING).unlink()
+            self._sync_run_directory()
+
     def _spawn_engine(self, exe: Path, *, config_test: bool = False) -> subprocess.Popen:
         """Internal: own the child immediately, before wrapper/marker work.
 
@@ -651,7 +686,7 @@ class RunContext:
         private YAML path and fixed engine flags can be passed here.
         """
         if (not self.active or self.closed or self.run_dir is None
-                or self.raw_child is not None or self.process is not None):
+                or self.raw_child is not None or self.process is not None or self._launch_unclaimed):
             raise PrivateRunError("PROCESS_START_FAILED")
         try:
             path = self.run_dir / "probe.yaml"
@@ -661,11 +696,14 @@ class RunContext:
             self._verify(path, directory=False)
             command = [str(exe)] + (["-t"] if config_test else [])
             command += ["-d", str(self.run_dir), "-f", str(path)]
+            self._begin_linux_launch()
+            self._launch_unclaimed = sys.platform == "linux"
             proc = subprocess.Popen(
                 command, cwd=str(self.run_dir), stdin=subprocess.DEVNULL,
                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, close_fds=True,
             )
             self.raw_child = proc
+            self._launch_unclaimed = False
             self.process = MihomoProcess(proc)
             identity = process_identity(proc.pid)
             if identity is None or identity.exe_fingerprint is None:
@@ -673,7 +711,10 @@ class RunContext:
                 # recovery identity, but a live unverifiable child is unsafe.
                 if proc.poll() is None:
                     raise PrivateRunError("PROCESS_START_FAILED")
+                if sys.platform == "linux":
+                    identity = None  # observed exit, not a partial child record
             self._write_marker(child=identity)
+            self._complete_linux_launch()
             return proc
         except PrivateRunError:
             raise
@@ -697,21 +738,31 @@ class RunContext:
 
     def spawn_synthetic_process(self) -> subprocess.Popen:
         """F1 synthetic child only, for proving own-PID cleanup without Mihomo."""
-        if not self.active or self.run_dir is None or self.process is not None:
+        if (not self.active or self.closed or self.run_dir is None or self.process is not None
+                or self.raw_child is not None or self._launch_unclaimed):
             raise PrivateRunError()
         try:
             env = {k: v for k, v in os.environ.items() if k.upper() in {
                 "SYSTEMROOT", "WINDIR", "PATH", "PYTHONHOME", "PYTHONPATH",
             }}
             flags = 0x08000000 if os.name == "nt" else 0
+            self._begin_linux_launch()
+            self._launch_unclaimed = sys.platform == "linux"
             proc = subprocess.Popen(
                 [sys.executable, "-c", "import time; time.sleep(60)"], cwd=self.run_dir,
                 stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                 env=env, creationflags=flags,
             )
             self.raw_child = proc  # retain ownership even if wrapper/marker raises
+            self._launch_unclaimed = False
             self.process = MihomoProcess(proc)
-            self._write_marker(child=process_identity(proc.pid))
+            identity = process_identity(proc.pid)
+            if sys.platform == "linux" and (identity is None or identity.exe_fingerprint is None):
+                if proc.poll() is None:
+                    raise PrivateRunError("PROCESS_START_FAILED")
+                identity = None
+            self._write_marker(child=identity)
+            self._complete_linux_launch()
             return proc
         except PrivateRunError:
             raise
@@ -720,6 +771,8 @@ class RunContext:
 
     def _stop_child(self) -> bool:
         """Stop only the exact owned child; report, never raise."""
+        if self._launch_unclaimed and self.raw_child is None:
+            return False  # constructor may have created a child before raising
         try:
             if self.process is not None:
                 self.process.close()

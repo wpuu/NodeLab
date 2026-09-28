@@ -126,12 +126,36 @@ def test_one_owner_two_sequential_children_and_private_markers(rig, capsys):
 
 
 @pytest.mark.parametrize("stage", ["check", "runtime"])
-def test_spawn_failure_removes_yaml(rig, stage):
+def test_spawn_failure_removes_yaml(rig, stage, monkeypatch):
     open_session, children, _, fault, root, _, _ = rig
     fault["spawn"] = stage
-    with pytest.raises(private.PrivateRunError, match="^PROCESS_START_FAILED$"):
-        with open_session():
-            pytest.fail("must not yield")
+    owners = []
+    original = private.RunContext.close
+
+    def close(owner):
+        owners.append(owner)
+        return original(owner)
+
+    try:
+        with monkeypatch.context() as patch:
+            patch.setattr(private.RunContext, "close", close)
+            code = "SECRET_CLEANUP_FAILED" if sys.platform == "linux" else "PROCESS_START_FAILED"
+            with pytest.raises(private.PrivateRunError, match=f"^{code}$"):
+                with open_session():
+                    pytest.fail("must not yield")
+        assert all(child.poll() is not None for child in children)
+        assert not list(root.glob("*/probe.yaml"))
+        if sys.platform == "linux":
+            assert len(list(root.glob("*/.owner-launch.tmp"))) == 1
+            assert len(list(root.glob("*/.owner.json"))) == 1
+            assert owners[-1]._launch_unclaimed and not owners[-1].closed
+    finally:
+        # This fixture raises BEFORE creating the failed child. Production
+        # cannot assume that of arbitrary constructor errors; only test teardown
+        # supplies this knowledge, after checking all real fixture children.
+        for owner in owners:
+            owner._launch_unclaimed = False
+            original(owner)
     assert_clean(children, root)
 
 
