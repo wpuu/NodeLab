@@ -58,11 +58,11 @@ tools/runtime/acceptance/bin/python scripts/f2_session_gate.py \
 - `session`：精确 11 个用例通过且零 skip；合成会话范围，不是实际代理协议证明。
 - `trojan-tcp`：精确 4 个用例通过且零 skip；实际本机 Trojan/TLS/TCP。
 - `vless-tcp`：精确 4 个用例通过且零 skip；实际本机 VLESS v0/零 addons/TLS/TCP。
-- `full`：当前精确 768 个 testcase，要求 765 passed，只允许三个指定 Windows 测试以 pytest.skip 跳过；不是任意三个 skip。失败诊断仅发布源码白名单中的测试函数标识，不包含参数或异常文本。增减测试时须审阅并更新 `FULL_EXPECTED_CASES`。
+- `full`：当前精确 787 个 testcase，要求 784 passed，只允许三个指定 Windows 测试以 pytest.skip 跳过；不是任意三个 skip。失败诊断仅发布源码白名单中的测试函数标识，不包含参数或异常文本。增减测试时须审阅并更新 `FULL_EXPECTED_CASES`。
 - 所有 gate 都要求固定二进制校验；不会接受环境变量提供的自定义摘要作为验收替代。
 - 即使协议 gate 通过，范围也仅为 `LOCAL_FIXTURE_ONLY`；不覆盖外部节点、Vision/WS/gRPC/Reality、Windows 或普通短请求的采样可靠性。
 
-最新远端执行状态见审计 027：完整 Linux 回归为 765 passed、3 个指定 Windows skip；三套独立 gate 为 11/4/4 个通过且零 skip。当前沙箱本身仍缺少受支持 Python 和可用官方二进制；不要混淆本地与远端结果。
+最新远端执行状态见审计 028：完整 Linux 回归为 784 passed、3 个指定 Windows skip；三套独立 gate 为 11/4/4 个通过且零 skip。当前沙箱本身仍缺少受支持 Python 和可用官方二进制；不要混淆本地与远端结果。
 
 ## 4. 可选：显式启用 GitHub Actions 验收
 
@@ -147,3 +147,9 @@ PR #2 的标签入口已经实际触发：[run 36399985871](https://github.com/w
 审计 027 取消恢复路径的数字 PID 信号 fallback。Linux 自动恢复终止现在需要 `os.pidfd_open`、`signal.pidfd_send_signal`、可用内核权限和完整匹配身份；不可核实时返回失败，不把读取 /proc 失败当成进程消失。旧内核/API 或权限受限环境不再尝试较弱的终止方式。正常持有 Popen 的清理路径不受此能力要求影响。
 
 [run 36413400189](https://github.com/wpuu/NodeLab/actions/runs/36413400189)，head `0ce612017f20141a010a33054d91d949ac494e0e`：完整回归 **765 passed、3 个指定 Windows skip**，三套独立 gate 11/4/4 全过且零 skip；check `108898701420` 的固定 annotations 已核对。新增 31 项后 full 总数为 768，生产门禁仍关闭。
+
+### Linux 恢复记录的启动实例绑定
+
+审计 028 增加 `linux_boot_fingerprint`。Linux 新运行必须能读取规范 `/proc/sys/kernel/random/boot_id`；只保存用途区分的摘要。恢复时旧记录缺字段、格式错误、与当前启动不同或当前标识不可读，都返回 `RECOVERY_REVIEW_REQUIRED`，不查询/终止记录中的进程，也不删除目录/YAML。不会自动把旧记录补写为当前启动：旧残留需要人工审阅，不能为解除阻塞而伪造绑定。
+
+[run 36414504335](https://github.com/wpuu/NodeLab/actions/runs/36414504335)，head `9884f59b40d464b7b6c12cf2db258df267cb126f`：完整回归 **784 passed、3 个指定 Windows skip**，独立 gate 11/4/4 全过且零 skip；check `108902279375` 的固定 annotations 已核对。新增 19 项后 full 总数为 787。本轮用注入标识模拟跨启动，不代表实际主机重启或 Windows 验收。
