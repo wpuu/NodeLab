@@ -352,7 +352,7 @@ def _linux_recovery_lock_matches(path: Path, fd: int) -> bool:
             and (held.st_dev, held.st_ino) == (named.st_dev, named.st_ino))
 
 
-def _acquire_linux_recovery_lock(path: Path) -> int:
+def _acquire_linux_recovery_lock(path: Path, *, create: bool = True) -> int:
     """Take an existing stale inode directly; never unlink before acquiring.
 
     An opener that raced the previous holder's unlink may own an unlinked old
@@ -360,7 +360,10 @@ def _acquire_linux_recovery_lock(path: Path) -> int:
     """
     import fcntl
 
-    fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600)
+    flags = os.O_RDWR | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK
+    if create:
+        flags |= os.O_CREAT
+    fd = os.open(path, flags, 0o600)
     try:
         if not _linux_lock_metadata(os.fstat(fd)):
             raise PrivateRunError("RECOVERY_REVIEW_REQUIRED")
@@ -368,6 +371,9 @@ def _acquire_linux_recovery_lock(path: Path) -> int:
         if not _linux_recovery_lock_matches(path, fd):
             raise PrivateRunError("RECOVERY_REVIEW_REQUIRED")
         return fd
+    except FileNotFoundError:
+        os.close(fd)
+        raise PrivateRunError("RECOVERY_REVIEW_REQUIRED") from None
     except BaseException:
         os.close(fd)
         raise
@@ -1041,6 +1047,20 @@ class _Recovery:
 
     @staticmethod
     def _remove_stale_lock(lock: Path) -> str | None:
+        if sys.platform == "linux":
+            try:
+                fd = _acquire_linux_recovery_lock(lock, create=False)
+            except FileNotFoundError:
+                # Only absence at open is harmless. Disappearance after open
+                # is ambiguous; acquisition converts that to a review error.
+                return None
+            except (OSError, ValueError, PrivateRunError):
+                return "RECOVERY_REVIEW_REQUIRED"
+            try:
+                _release_linux_recovery_lock(lock, fd)
+            except (OSError, ValueError, PrivateRunError):
+                return "RECOVERY_REVIEW_REQUIRED"
+            return None
         state = _lock_state(lock)
         if state in {"missing", "live"}:
             return None  # nothing left, or (re)acquired by a live run meanwhile
@@ -1063,10 +1083,14 @@ class _Recovery:
                     state = _lock_state(entry)  # a lock without a directory
                     if state == "live":
                         continue  # a run started meanwhile; it is not residue
+                    code = None
                     if state == "stale":
-                        entry.unlink()
+                        if sys.platform == "linux":
+                            code = self._remove_stale_lock(entry)
+                        else:
+                            entry.unlink()
                     if state in {"stale", "missing"}:
-                        rows.append(_recovery_row(number, None))
+                        rows.append(_recovery_row(number, code))
                     else:
                         rows.append(_recovery_row(number, "RECOVERY_REVIEW_REQUIRED"))
                     continue
