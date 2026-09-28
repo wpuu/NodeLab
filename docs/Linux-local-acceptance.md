@@ -58,11 +58,11 @@ tools/runtime/acceptance/bin/python scripts/f2_session_gate.py \
 - `session`：精确 11 个用例通过且零 skip；合成会话范围，不是实际代理协议证明。
 - `trojan-tcp`：精确 4 个用例通过且零 skip；实际本机 Trojan/TLS/TCP。
 - `vless-tcp`：精确 4 个用例通过且零 skip；实际本机 VLESS v0/零 addons/TLS/TCP。
-- `full`：当前精确 938 个 testcase，要求 935 passed，只允许三个指定 Windows 测试以 pytest.skip 跳过；不是任意三个 skip。失败诊断仅发布源码白名单中的测试函数标识，不包含参数或异常文本。增减测试时须审阅并更新 `FULL_EXPECTED_CASES`。
+- `full`：当前精确 957 个 testcase，要求 954 passed，只允许三个指定 Windows 测试以 pytest.skip 跳过；不是任意三个 skip。失败诊断仅发布源码白名单中的测试函数标识，不包含参数或异常文本。增减测试时须审阅并更新 `FULL_EXPECTED_CASES`。
 - 所有 gate 都要求固定二进制校验；不会接受环境变量提供的自定义摘要作为验收替代。
 - 即使协议 gate 通过，范围也仅为 `LOCAL_FIXTURE_ONLY`；不覆盖外部节点、Vision/WS/gRPC/Reality、Windows 或普通短请求的采样可靠性。
 
-最新远端执行状态见审计 037：完整 Linux 回归为 935 passed、3 个指定 Windows skip；三套独立 gate 为 11/4/4 个通过且零 skip。当前沙箱本身仍缺少受支持 Python 和可用官方二进制；不要混淆本地与远端结果。
+最新远端执行状态见审计 038：完整 Linux 回归为 954 passed、3 个指定 Windows skip；三套独立 gate 为 11/4/4 个通过且零 skip。当前沙箱本身仍缺少受支持 Python 和可用官方二进制；不要混淆本地与远端结果。
 
 ## 4. 可选：显式启用 GitHub Actions 验收
 
@@ -213,3 +213,9 @@ PR #2 的标签入口已经实际触发：[run 36399985871](https://github.com/w
 审计 037 提供 `nodelab recover --inspect`（与 --confirm 互斥）：有界扫描、分类残留，不读 YAML、不查询进程身份、不探测/获取锁，不发送信号或删除文件。独立白名单 JSON 不输出路径、PID 或凭据，COMPLETE 仅表示检查完成，不是恢复授权。锁只报告存在但未核验。详见 [只读检查说明](Linux-recovery-inspection.md)。
 
 [run 36451360873](https://github.com/wpuu/NodeLab/actions/runs/36451360873)，head `ed86eee6f6398c09841f2ac78c6a5a4d8f3ee9f2`：完整回归 **935 passed、3 个指定 Windows skip**，独立 gate 11/4/4 全过且零 skip，check `109026653084` 固定 annotations 已核对。新增 22 项，full 总数为 938。检查不解除阻塞，不补全未知 PID，不开放 Windows 或生产门禁。
+
+### Linux 锁文件核验与未知状态拒绝
+
+审计 038 对锁路径及实际打开对象核对普通文件/当前 UID/0600/单硬链接/零长度，只有明确的 flock 竞争按 live 处理，其他错误为 unsafe；恢复处理目录前再次拒绝 unsafe 或新近 live 的锁。inspection 共用外观规则，但依然不探测锁。异常旧锁可能需要人工复核，不自动修正。
+
+[run 36454765941](https://github.com/wpuu/NodeLab/actions/runs/36454765941)，head `d5b9a28e4f418e8779d7295a6a581aaceca3f8e4`：完整回归 **954 passed、3 个指定 Windows skip**，独立 gate 11/4/4 全过且零 skip，check `109038168013` 固定 annotations 已核对。新增 19 项，full 总数为 957。检查/使用仍非原子，stale 恢复锁并发接管与 unlink/recreate 竞态未因此解决。

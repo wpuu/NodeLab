@@ -38,7 +38,7 @@ nodelab recover --inspect --root /absolute/private/root
 | LOCK_WITHOUT_DIRECTORY | 本次扫描看到了锁文件但没看到对应目录，不表示锁已失效 |
 | RECOVERY_LOCK_PRESENT | 存在恢复锁文件，不判断是否正被占用 |
 
-`lock_state=PRESENT_UNCHECKED` 只表示外观符合私有普通锁文件要求；**不代表 live，也不代表 stale**。`ABSENT` 只表示检查时未发现，`UNSAFE` 表示类型/权限等不符或检查失败，`NOT_APPLICABLE` 用于无法关联 run 的入口。
+`lock_state=PRESENT_UNCHECKED` 只表示外观符合当前 UID、0600、单硬链接、零长度的普通锁文件要求；**不代表 live，也不代表 stale**。`ABSENT` 只表示检查时未发现，`UNSAFE` 表示类型/权限等不符或检查失败，`NOT_APPLICABLE` 用于无法关联 run 的入口。
 
 ## 遇到残留时
 
