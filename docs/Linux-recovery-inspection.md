@@ -55,3 +55,5 @@ Linux 的显式恢复另行打开并持有 `.recover.lock` 的排他 flock，取
 只读指本工具不显式写、删、改文件；普通读取可能触发内核的 atime 更新。敌对父目录替换、同身份恶意写入和并发变化不因此获得完整保护；结果仅是短暂观察，不是认证。
 
 生产门禁仍关闭：`PROBE_GATE_OPEN=False`、`REAL_NODE_TEST_ALLOWED_NOW=NO`。该工具不是 Windows、断电恢复、外部节点或生产验收证明。
+
+Linux 普通 run 锁的残留删除也必须打开现有锁、取得 flock 并核对 inode，不因一次 stale 探测直接 unlink，也不补建缺失锁。竞争或打开后路径变化要求复核。此规则只保护锁删除，尚未把整个 run 目录恢复变为持锁事务；见审计 040。
