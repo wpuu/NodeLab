@@ -80,6 +80,18 @@ jobs:
           python scripts/f2_session_gate.py --suite vless-tcp \
             --exe "$PWD/tools/mihomo/mihomo" | tee tools/acceptance-report/vless-tcp.json
 
+      # These are the same fixed-field JSON reports already printed by gates.
+      # Check annotations remain API-readable when artifact downloads are blocked.
+      - name: Publish fixed-field check annotations
+        if: ${{ !cancelled() && steps.prepare.outcome != 'skipped' }}
+        run: |
+          for report in preparation session trojan-tcp vless-tcp; do
+            path="tools/acceptance-report/$report.json"
+            if [[ -f "$path" ]]; then
+              printf '::notice title=Local acceptance %s::%s\n' "$report" "$(cat "$path")"
+            fi
+          done
+
       - name: Retain fixed-field reports only
         if: ${{ !cancelled() && steps.prepare.outcome != 'skipped' }}
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4

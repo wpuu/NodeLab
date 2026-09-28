@@ -74,3 +74,11 @@ def test_artifact_upload_is_explicit_allowlist_not_logs_or_runtime():
     assert upload["with"]["retention-days"] == 7
     assert "!cancelled()" in upload["if"]
     assert not upload["with"].get("include-hidden-files", False)
+
+
+def test_annotations_only_publish_known_fixed_field_reports():
+    step = next(step for step in STEPS if step["name"] == "Publish fixed-field check annotations")
+    assert "for report in preparation session trojan-tcp vless-tcp; do" in step["run"]
+    assert 'path="tools/acceptance-report/$report.json"' in step["run"]
+    assert "::notice title=Local acceptance" in step["run"]
+    assert "!cancelled()" in step["if"]
