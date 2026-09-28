@@ -195,8 +195,8 @@ def linux_owner_gone(expected: ProcessIdentity) -> bool:
 def terminate_verified_process(expected: ProcessIdentity, *, budget: float = STOP_BUDGET_SECONDS) -> bool:
     """Terminate a pid only while it still is exactly `expected`; True when gone.
 
-    An identity mismatch means the recorded child already exited (and the pid
-    may belong to someone else), so nothing is signalled. Linux recovery
+    On Linux, a known different creation stamp means the recorded child
+    exited; a changed executable alone may be exec(), not death. Linux recovery
     requires pidfd APIs and a complete matching fingerprint before signalling;
     an unreadable identity is not itself proof of exit.
     """
@@ -241,10 +241,15 @@ def terminate_verified_process(expected: ProcessIdentity, *, budget: float = STO
         current = _linux_identity(expected.pid)
         if not _recovery_identity(current):
             return exited()  # None also means permission/read errors, NOT gone
-        if not expected.matches(current):
-            return True  # known different identity: leave it untouched
-        if expected.exe_fingerprint is None or current.exe_fingerprint is None:
-            return False
+        if current.pid != expected.pid:
+            return exited()  # inconsistent lookup is not proof of PID reuse
+        if current.create_time != expected.create_time:
+            return True  # known different lifetime: leave it untouched
+        if (expected.exe_fingerprint is None or current.exe_fingerprint is None
+                or expected.exe_fingerprint != current.exe_fingerprint):
+            # The same process can exec a different image. Do not signal it,
+            # but do not erase its recovery evidence by claiming it is gone.
+            return exited()
 
         # After binding, only descriptor readiness or ESRCH confirms exit;
         # a later unreadable /proc record must not turn into successful cleanup.
