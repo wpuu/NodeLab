@@ -59,7 +59,7 @@ tools/runtime/acceptance/bin/python scripts/f2_session_gate.py \
 - 所有 gate 都要求固定二进制校验；不会接受环境变量提供的自定义摘要作为验收替代。
 - 即使协议 gate 通过，范围也仅为 `LOCAL_FIXTURE_ONLY`；不覆盖外部节点、Vision/WS/gRPC/Reality、Windows 或普通短请求的采样可靠性。
 
-当前执行状态见审计 018：尚无可用官方二进制或受支持 Python；三套 gate 均被 Python 版本前置条件阻塞，真实互操作未执行。
+最新远端执行状态见审计 021：三套 gate 已在 GitHub 托管 Linux runner 通过，分别为 11/4/4 个通过且零 skip。当前沙箱本身仍缺少受支持 Python 和可用官方二进制；不要混淆本地与远端结果。
 
 ## 4. 可选：显式启用 GitHub Actions 验收
 
@@ -95,8 +95,16 @@ gh run list --workflow linux-local-acceptance.yml --branch arena/01a0e60c-nodela
 
 检查具体 run 的 commit、结论和所有三个 gate 的 JSON，不以 artifact 存在或 preparation 成功替代验收。即使全部通过，也仍仅限本机 fixture 范围，`real_node_test_allowed` 必须为 false。静态 YAML/测试检查不属于 GitHub runner 执行证据。
 
-### 最近一次远端运行：基础设施阻塞
+### 历史远端运行：基础设施阻塞（已被后续成功运行取代）
 
 PR #2 的标签入口已经实际触发：[run 36399985871](https://github.com/wpuu/NodeLab/actions/runs/36399985871)，head `5f7f80871273592a8f92b934f42bf68ad94be587`。GitHub 因账户付款失败或支出额度限制阻止 job 启动；`steps=[]`、artifact 数量为 0。没有执行任何 gate，此 failure 不是测试失败，也不是验收通过。
 
 已暂时移除 `run-local-acceptance` 标签。账户维护者需先检查 GitHub 的 Billing & plans / Actions 支付与额度，之后再添加标签以验证最新 revision；不要通过修改 gate 或反复 rerun 绕过基础设施阻塞。详见审计 020。无需提供任何账单信息或凭据给本工具。
+
+### 最新远端运行：三套 gate 通过
+
+用户将仓库公开后，run 36402330033 和 [run 36402531966](https://github.com/wpuu/NodeLab/actions/runs/36402531966) 均成功。后者 head 为 `a10c1dbe661bca8f2408fedfbdf54540e09c97fa`，已通过 check annotations API 核对：session 11 passed、Trojan TCP 4 passed、VLESS TCP 4 passed，全部零 skip。双摘要官方 Mihomo 准备成功，真实协议 gate 范围仅 `LOCAL_FIXTURE_ONLY`，真实节点使用/授权仍为 false。
+
+当前沙箱无法下载 Actions blob 附件，因此工作流新增同一份固定字段 JSON 的 check notices；可通过 `gh api repos/wpuu/NodeLab/check-runs/108863525420/annotations` 读取。不会发布原始引擎日志或测试凭据。审计 021 记录证据和限制。
+
+本轮已移除 opt-in 标签，避免文档更新重复触发；后续代码验收仍可重新添加。无需为此次本机验收调整支出预算。公共仓库运行成功不等于账户账单状态全面正常，也不等于所有平台或生产探测通过。
