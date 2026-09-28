@@ -444,6 +444,28 @@ def start_verified_engine(
         # a collector after a possible PID reuse. Missing identity means a
         # future bound reader must refuse this handle.
         identity = process_identity(proc.pid)
+
+        def controller_guard():
+            check()
+            if proc.poll() is not None:
+                raise EngineLaunchError("ENGINE_EXITED")
+            code = step(listener_owned_by, proc.pid, int(controller_port))
+            if code != "LAUNCH_OK":
+                raise EngineLaunchError(code)
+            if proc.poll() is not None:
+                raise EngineLaunchError("ENGINE_EXITED")
+            check()
+
+        def controller_step(function, path, credential):
+            # Initial readiness is not a reusable ownership authorization.
+            # Reject a stale response before any subsequent token-bearing call.
+            # These pre/post checks narrow, but do not atomically close, the
+            # socket-query-to-HTTP race. Every check shares the launch deadline.
+            controller_guard()
+            result = step(function, base, path, credential)
+            controller_guard()
+            return result
+
         # Establish controller ownership BEFORE any HTTP traffic, especially
         # before disclosing the run token. Auth alone does not identify a PID.
         controller_code = "LISTENER_MISSING"
@@ -465,7 +487,7 @@ def start_verified_engine(
             check()
             if proc.poll() is not None:
                 raise EngineLaunchError("ENGINE_EXITED")
-            status = step(_controller_status, base, "/configs", None)
+            status = controller_step(_controller_status, "/configs", None)
             if status is not None:
                 break
             pause()
@@ -476,9 +498,9 @@ def start_verified_engine(
 
         # 2. a wrong token stays rejected, the run token is accepted.
         wrong = secret[:-1] + ("x" if secret[-1] != "x" else "y")
-        if step(_controller_status, base, "/configs", wrong) != 401:
+        if controller_step(_controller_status, "/configs", wrong) != 401:
             raise EngineLaunchError("CONTROLLER_AUTH_WEAK")
-        if step(_controller_status, base, "/configs", secret) != 200:
+        if controller_step(_controller_status, "/configs", secret) != 200:
             raise EngineLaunchError("CONTROLLER_AUTH_WEAK")
 
         # 3. the data-plane listener belongs to this exact child.
@@ -496,9 +518,9 @@ def start_verified_engine(
 
         # 4. Query actual routing state: group selection alone does not exclude
         # global/direct mode, fallback members, extra rules or disabled MATCH.
-        configs = step(_controller_json, base, "/configs", secret)
-        proxies = step(_controller_json, base, "/proxies", secret)
-        rules = step(_controller_json, base, "/rules", secret)
+        configs = controller_step(_controller_json, "/configs", secret)
+        proxies = controller_step(_controller_json, "/proxies", secret)
+        rules = controller_step(_controller_json, "/rules", secret)
         _verify_runtime_routing(configs, proxies, rules)
 
         if proc.poll() is not None:

@@ -117,15 +117,24 @@ def test_verified_controller_precedes_auth_and_data_listener(monkeypatch, tmp_pa
         }},
         "/rules": {"rules": [{"index": 0, "type": "Match", "payload": "", "proxy": "PROBE"}]},
     }
-    monkeypatch.setattr(launch, "_controller_json", lambda base, path, token, **kwargs: snapshots[path])
+    def snapshot(base, path, token, **kwargs):
+        events.append(("json", path))
+        return snapshots[path]
+
+    monkeypatch.setattr(launch, "_controller_json", snapshot)
     engine = launch.start_verified_engine(
         exe=tmp_path / "synthetic", run_dir=tmp_path,
         config_path=tmp_path / "probe.yaml", mixed_port=12001,
         controller_port=12002, secret=token,
     )
     assert engine.proc is proc
-    assert events == [("owner", 12002), ("http", False), ("http", True),
-                      ("http", True), ("owner", 12001)]
+    expected = [("owner", 12002)]
+    for authenticated in (False, True, True):
+        expected += [("owner", 12002), ("http", authenticated), ("owner", 12002)]
+    expected.append(("owner", 12001))
+    for path in ("/configs", "/proxies", "/rules"):
+        expected += [("owner", 12002), ("json", path), ("owner", 12002)]
+    assert events == expected
     proc.kill.assert_not_called()
 
 
@@ -185,3 +194,54 @@ def test_controller_strict_json_over_actual_loopback_http(body, expected):
     with server(body=body) as (base, received):
         assert launch._controller_json(base, "/connections", token) == expected
         assert received == ["Bearer " + token]
+
+
+@pytest.mark.parametrize("stage", range(6), ids=["unauth", "wrong_token", "valid_token", "configs", "proxies", "rules"])
+@pytest.mark.parametrize("fault", ["takeover", "exit"])
+def test_preflight_discards_each_response_if_controller_owner_changes(monkeypatch, tmp_path, stage, fault):
+    proc = Mock(pid=12345)
+    proc.poll.return_value = None
+    proc.terminate.side_effect = lambda: setattr(proc.poll, "return_value", 0)
+    monkeypatch.setattr(launch.engine_binary, "verify_pinned_binary", lambda *a, **k: (True, "BINARY_OK"))
+    monkeypatch.setattr(launch.subprocess, "Popen", Mock(return_value=proc))
+    token = secrets.token_urlsafe(32)
+    state = {"calls": 0, "changed": False}
+    ownership = Mock(side_effect=lambda pid, port, **k:
+                     "LISTENER_FOREIGN_OWNER" if port == 12002 and state["changed"] else "LAUNCH_OK")
+    monkeypatch.setattr(launch, "listener_owned_by", ownership)
+    snapshots = {
+        "/configs": {"mode": "rule"},
+        "/proxies": {"proxies": {"NODE": {"type": "Vless"},
+                     "PROBE": {"type": "Selector", "now": "NODE", "all": ["NODE"]}}},
+        "/rules": {"rules": [{"index": 0, "type": "Match", "payload": "", "proxy": "PROBE"}]},
+    }
+
+    def changed():
+        if state["calls"] == stage:
+            if fault == "exit":
+                proc.poll.return_value = 1
+            else:
+                state["changed"] = True
+        state["calls"] += 1
+
+    def status(base, path, credential, **kwargs):
+        changed()
+        return 200 if credential == token else 401
+
+    def snapshot(base, path, credential, **kwargs):
+        changed()
+        return snapshots[path]
+
+    monkeypatch.setattr(launch, "_controller_status", status)
+    monkeypatch.setattr(launch, "_controller_json", snapshot)
+    expected = "ENGINE_EXITED" if fault == "exit" else "LISTENER_FOREIGN_OWNER"
+    with pytest.raises(launch.EngineLaunchError, match=f"^{expected}$"):
+        launch.start_verified_engine(exe=tmp_path / "synthetic", run_dir=tmp_path,
+            config_path=tmp_path / "probe.yaml", mixed_port=12001, controller_port=12002, secret=token)
+    # Do not send the next (possibly authenticated) request after a stale reply.
+    assert state["calls"] == stage + 1
+    if fault == "takeover":
+        proc.terminate.assert_called_once_with()
+    else:
+        proc.terminate.assert_not_called()
+    proc.kill.assert_not_called()

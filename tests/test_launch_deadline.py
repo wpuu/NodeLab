@@ -87,9 +87,11 @@ def test_expired_stage_never_continues_even_if_it_returned_success(harness, stag
 def test_all_stages_use_same_absolute_deadline(harness):
     run, proc, _, events, costs = harness
     costs.update({"binary": 0.2, "12002": 0.1, "unauth": 0.1})
-    engine = run()
-    assert {event[1] for event in events} == {101.0}
-    assert events[-1][2] == pytest.approx(0.6)
+    engine = run(budget=2.0)
+    assert {event[1] for event in events} == {102.0}
+    # Initial readiness + pre/post checks for all six controller calls.
+    assert sum(event[0] == "12002" for event in events) == 13
+    assert events[-1][2] == pytest.approx(0.5)
     engine.close()
 
 
@@ -181,3 +183,55 @@ def test_invalid_or_oversized_controller_body_is_not_accepted(monkeypatch, data)
     monkeypatch.setattr(launch, "_controller_open", lambda *a, **k: response)
     assert launch._controller_json("http://127.0.0.1:12002", "/configs", secrets.token_urlsafe(32)) is None
     assert response.closed
+
+
+def test_final_controller_guard_cannot_extend_launch_budget(harness, monkeypatch):
+    run, proc, _, events, costs = harness
+    original = launch.listener_owned_by
+    checks = 0
+
+    def owned(pid, port, **kwargs):
+        nonlocal checks
+        if port == 12002:
+            checks += 1
+            if checks == 13:
+                costs["12002"] = 1.0
+        return original(pid, port, **kwargs)
+
+    monkeypatch.setattr(launch, "listener_owned_by", owned)
+    with pytest.raises(launch.EngineLaunchError, match="^LAUNCH_TIMEOUT$"):
+        run()
+    assert checks == 13
+    assert [event[0] for event in events][-2:] == ["/rules", "12002"]
+    proc.terminate.assert_called_once_with()
+
+
+@pytest.mark.parametrize("code", ["LISTENER_MISSING", "LISTENER_FOREIGN_OWNER", "LISTENER_NOT_LOOPBACK", "LISTENER_UNVERIFIABLE"])
+def test_lost_controller_before_first_http_is_not_retried(harness, monkeypatch, code):
+    run, proc, _, events, _ = harness
+    ownership = Mock(side_effect=["LAUNCH_OK", code])
+    monkeypatch.setattr(launch, "listener_owned_by", ownership)
+    with pytest.raises(launch.EngineLaunchError, match=f"^{code}$"):
+        run()
+    assert ownership.call_count == 2
+    assert [event[0] for event in events] == ["binary"]
+    proc.terminate.assert_called_once_with()
+
+
+def test_child_exit_during_controller_guard_prevents_http(harness, monkeypatch):
+    run, proc, _, events, _ = harness
+    checks = 0
+
+    def owned(*args, **kwargs):
+        nonlocal checks
+        checks += 1
+        if checks == 2:
+            proc.poll.return_value = 1
+        return "LAUNCH_OK"
+
+    monkeypatch.setattr(launch, "listener_owned_by", owned)
+    with pytest.raises(launch.EngineLaunchError, match="^ENGINE_EXITED$"):
+        run()
+    assert checks == 2
+    assert [event[0] for event in events] == ["binary"]
+    proc.terminate.assert_not_called()
