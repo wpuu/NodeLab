@@ -48,7 +48,8 @@ def test_unexpected_stop_exception_still_removes_yaml_and_reports_fixed_failure(
         assert type(error) is PrivateRunError
         assert error.code == "SECRET_CLEANUP_FAILED"
         assert sentinel not in "".join(traceback.format_exception(error))
-        assert not owner.run_dir.exists()
+        assert not (owner.run_dir / "probe.yaml").exists()
+        assert (owner.run_dir / ".owner.json").is_file()
         assert child.poll() is None  # do not pretend that failing stop succeeded
         assert owner.closed is False and owner.active is True
         assert _lock_state(owner._lock_path) == "live"
@@ -133,7 +134,8 @@ def test_cleanup_failure_suppresses_earlier_body_error_text(owner, monkeypatch):
         assert error.code == "SECRET_CLEANUP_FAILED"
         assert error.__suppress_context__ is True
         assert sentinel not in "".join(traceback.format_exception(error))
-        assert not owner.run_dir.exists()
+        assert not (owner.run_dir / "probe.yaml").exists()
+        assert (owner.run_dir / ".owner.json").is_file()
 
 
 def test_both_cleanup_faults_still_attempt_both_phases(owner, monkeypatch):
@@ -141,7 +143,7 @@ def test_both_cleanup_faults_still_attempt_both_phases(owner, monkeypatch):
         stop = Mock(side_effect=RuntimeError(secrets.token_urlsafe(32)))
         remove = Mock(side_effect=KeyboardInterrupt(secrets.token_urlsafe(32)))
         patch.setattr(owner, "_stop_child", stop)
-        patch.setattr(owner, "_remove_private_tree", remove)
+        patch.setattr(owner, "_remove_private_payload", remove)
         error = capture_failure(owner.close)
         assert type(error) is PrivateRunError
         assert error.code == "SECRET_CLEANUP_FAILED"

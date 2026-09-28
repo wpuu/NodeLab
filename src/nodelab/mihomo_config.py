@@ -220,6 +220,31 @@ def _check_clean_private_tree(path: Path) -> None:
             pending.extend(current.iterdir())
 
 
+
+def _remove_payload_preserving_evidence(path: Path) -> None:
+    """Linux failed-stop cleanup; keep only application recovery metadata.
+
+    Staging files must also remain: deleting them could turn an ambiguous
+    marker publication into an apparently recoverable old record. They are
+    written without credentials, but still require the private directory.
+    """
+    _check_clean_private_tree(path)
+
+    def metadata(entry: Path) -> bool:
+        return entry.is_file() and (entry.name == _MARKER or
+                                   (entry.name.startswith(".owner-") and entry.name.endswith(".tmp")))
+
+    for entry in sorted(path.iterdir(), key=lambda p: p.name != "probe.yaml"):
+        if metadata(entry):
+            continue
+        if entry.is_dir():
+            shutil.rmtree(entry)
+        else:
+            entry.unlink()
+    if any(not metadata(entry) for entry in path.iterdir()):
+        raise PrivateRunError("SECRET_CLEANUP_FAILED")
+
+
 def _acquire_lock(path: Path) -> int:
     """Create `path` exclusively and hold an OS lock on it for this process.
 
@@ -684,6 +709,20 @@ class RunContext:
         self._private_tree_removed = True
         return True
 
+    def _remove_private_payload(self) -> bool:
+        """On Linux unknown stop, keep evidence without claiming tree removal."""
+        if self.run_dir is None:
+            return False
+        try:
+            if self.run_dir.parent != self.root:
+                return False
+            self._verify(self.root, directory=True)
+            self._verify(self.run_dir, directory=True)
+            _remove_payload_preserving_evidence(self.run_dir)
+        except (OSError, ValueError, PrivateRunError):
+            return False
+        return True
+
     def close(self) -> None:
         if self.closed:
             return
@@ -691,9 +730,10 @@ class RunContext:
             self.closed = True
             return
         # Stop the child first (contract E2), but a stop failure must never
-        # skip deleting the plaintext: an orphaned synthetic child is far less
-        # harmful than a credential left on disk.  Both steps always run and
-        # a single fixed code reports if either one is not confirmed.
+        # skip deleting the plaintext. On Linux an unknown stop keeps the
+        # non-secret recovery evidence, so a later owner crash need not lose
+        # the last child identity. Neither payload removal nor retained
+        # evidence is a successful close; the lock stays owned for retry.
         stopped = removed = False
         try:
             try:
@@ -705,7 +745,10 @@ class RunContext:
                 pass
         finally:
             try:
-                removed = self._remove_private_tree() is True
+                if not stopped and sys.platform == "linux":
+                    removed = self._remove_private_payload() is True
+                else:
+                    removed = self._remove_private_tree() is True
             except BaseException:
                 pass
         if not (stopped and removed):
@@ -802,9 +845,19 @@ class _Recovery:
             child_pid, child_stamp = marker.get("child_pid"), marker.get("child_create_time")
             if child_pid is not None and child_stamp is not None:
                 child = ProcessIdentity(child_pid, child_stamp, marker.get("child_exe_fingerprint"))
-                stop_failed = not terminate_verified_process(child)
+                try:
+                    stop_failed = terminate_verified_process(child) is not True
+                except BaseException:
+                    if sys.platform != "linux":
+                        raise
+                    # Like owned close, cancellation/unknown stop must not
+                    # bypass plaintext cleanup or erase recovery evidence.
+                    stop_failed = True
             elif child_pid is not None:
                 stop_failed = True  # child recorded but unverifiable: report, never kill
+        if stop_failed and sys.platform == "linux":
+            _remove_payload_preserving_evidence(run_dir)
+            return "PROCESS_STOP_FAILED"
         _check_clean_private_tree(run_dir)
         shutil.rmtree(run_dir)
         if run_dir.exists() or run_dir.is_symlink():
@@ -846,7 +899,7 @@ class _Recovery:
                     rows.append(_recovery_row(number, "RECOVERY_REVIEW_REQUIRED"))
                     continue
                 code = self.recover_dir(entry)
-                if code is None or code == "PROCESS_STOP_FAILED":
+                if code is None or (code == "PROCESS_STOP_FAILED" and sys.platform != "linux"):
                     lock_code = self._remove_stale_lock(self.root / (entry.name + _LOCK_SUFFIX))
                     code = code or lock_code
                 rows.append(_recovery_row(number, code))
@@ -861,8 +914,10 @@ def recover_stale_runs(root: Path | None = None) -> list[dict[str, Any]]:
     Only directories this application created (run-id name, verified ACL/
     mode, marker naming this very directory) are touched.  A recorded child
     is terminated only while its pid, creation stamp and executable digest
-    still match the marker; anything unverifiable is reported as
-    RECOVERY_REVIEW_REQUIRED and left alone.  Live runs are skipped.
+    still match the marker. Untrusted records require review and remain
+    untouched. On Linux an unconfirmed child stop removes payload but keeps
+    recovery metadata and reports PROCESS_STOP_FAILED (or cleanup failure).
+    Live runs are skipped.
     Returns one fixed-shape row per handled entry (no paths, no ids).
     """
     probe = RunContext(root)  # applies the same root rules, never enters

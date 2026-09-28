@@ -583,7 +583,11 @@ def test_stop_failure_still_deletes_plaintext_and_reports_cleanup_failure(tmp_pa
         assert info.value.code == "SECRET_CLEANUP_FAILED"
         assert sentinel not in str(info.value)
         # The credential must not outlive the run just because the child did.
-        assert not yaml_path.exists() and not run_dir.exists()
+        assert not yaml_path.exists()
+        if sys.platform == "linux":
+            assert (run_dir / ".owner.json").is_file()  # retain recovery evidence
+        else:
+            assert not run_dir.exists()
         assert not ctx.closed and owned.poll() is None  # honestly still owned, not "closed"
         # A later retry with a stoppable child completes the same run.
         ctx.close()
