@@ -1,0 +1,115 @@
+name: Linux local engine acceptance
+
+# Explicit opt-in only: manual dispatch or a labeled same-repository PR.
+# Never pull_request_target; no external node or credential input.
+"on":
+  workflow_dispatch:
+  pull_request:
+    branches: [main]
+    types: [labeled, synchronize, reopened]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: linux-local-acceptance-${{ github.ref }}
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  local-acceptance:
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.pull_request.head.repo.full_name == github.repository &&
+       contains(github.event.pull_request.labels.*.name, 'run-local-acceptance'))
+    runs-on: ubuntu-24.04
+    # A runner timeout/cancellation is NOT cleanup or acceptance evidence.
+    timeout-minutes: 20
+    steps:
+      - name: Checkout selected revision
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1, node24
+        with:
+          persist-credentials: false
+
+      - name: Set up supported Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0, node24
+        with:
+          python-version: '3.12'
+
+      - name: Install project and test dependencies
+        id: dependencies
+        run: |
+          python -m pip install -e . pytest
+          command -v openssl >/dev/null
+
+      - name: Download and prepare pinned official bytes
+        id: prepare
+        run: |
+          umask 077
+          mkdir -p tools/downloads tools/mihomo tools/acceptance-report
+          curl --fail --silent --show-error --location \
+            --proto '=https' --proto-redir '=https' \
+            --connect-timeout 15 --max-time 180 \
+            --output tools/downloads/mihomo.gz \
+            https://github.com/MetaCubeX/mihomo/releases/download/v1.19.31/mihomo-linux-amd64-compatible-v1.19.31.gz
+          python scripts/prepare_mihomo_linux.py \
+            --archive "$PWD/tools/downloads/mihomo.gz" \
+            --destination "$PWD/tools/mihomo/mihomo" \
+            | tee tools/acceptance-report/preparation.json
+
+      # Preserve a failed job while still trying the independent gates. Never
+      # continue-on-error: even one BLOCKED/FAIL must prevent a green job.
+      - name: Synthetic real-engine session gate
+        if: ${{ !cancelled() && steps.prepare.outcome == 'success' && steps.dependencies.outcome == 'success' }}
+        run: |
+          python scripts/f2_session_gate.py --suite session \
+            --exe "$PWD/tools/mihomo/mihomo" | tee tools/acceptance-report/session.json
+
+      - name: Local Trojan TLS TCP gate
+        if: ${{ !cancelled() && steps.prepare.outcome == 'success' && steps.dependencies.outcome == 'success' }}
+        run: |
+          python scripts/f2_session_gate.py --suite trojan-tcp \
+            --exe "$PWD/tools/mihomo/mihomo" | tee tools/acceptance-report/trojan-tcp.json
+
+      - name: Local VLESS TLS TCP gate
+        if: ${{ !cancelled() && steps.prepare.outcome == 'success' && steps.dependencies.outcome == 'success' }}
+        run: |
+          python scripts/f2_session_gate.py --suite vless-tcp \
+            --exe "$PWD/tools/mihomo/mihomo" | tee tools/acceptance-report/vless-tcp.json
+
+      - name: Full Linux regression with pinned engine
+        if: ${{ !cancelled() && steps.prepare.outcome == 'success' && steps.dependencies.outcome == 'success' }}
+        run: |
+          python scripts/f2_session_gate.py --suite full \
+            --exe "$PWD/tools/mihomo/mihomo" | tee tools/acceptance-report/full.json
+
+      # These are the same fixed-field JSON reports already printed by gates.
+      # Check annotations remain API-readable when artifact downloads are blocked.
+      - name: Publish fixed-field check annotations
+        if: ${{ !cancelled() && steps.prepare.outcome != 'skipped' }}
+        run: |
+          for report in preparation session trojan-tcp vless-tcp full; do
+            path="tools/acceptance-report/$report.json"
+            if [[ -f "$path" ]]; then
+              printf '::notice title=Local acceptance %s::%s\n' "$report" "$(cat "$path")"
+            fi
+          done
+
+      - name: Retain fixed-field reports only
+        if: ${{ !cancelled() && steps.prepare.outcome != 'skipped' }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1, node24
+        with:
+          name: local-gate-results-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            tools/acceptance-report/preparation.json
+            tools/acceptance-report/session.json
+            tools/acceptance-report/trojan-tcp.json
+            tools/acceptance-report/vless-tcp.json
+            tools/acceptance-report/full.json
+          if-no-files-found: warn
+          retention-days: 7
+          include-hidden-files: false
+          archive: true

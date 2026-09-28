@@ -30,6 +30,7 @@ _ERROR_CODE = frozenset({
     "CONFIG_TEST_TIMEOUT", "CONFIG_BUILD_FAILED", "BINARY_MISMATCH",
     "PROCESS_START_FAILED", "PROCESS_STOP_FAILED", "PRIVATE_DIR_UNSAFE",
     "SECRET_CLEANUP_FAILED", "RECOVERY_REVIEW_REQUIRED",
+    "RECOVERY_INSPECTION_UNSUPPORTED", "RECOVERY_INSPECTION_LIMIT", "RECOVERY_INSPECTION_FAILED",
     "UNSUPPORTED_INSECURE_NOT_APPROVED", "PUBLIC_SCHEMA_REJECTED",
 })
 
@@ -101,3 +102,38 @@ def redact_value(value: Any) -> Any:
     if isinstance(value, (Mapping, ParsedNode, list, tuple)):
         return redacted_result_dict(value)
     return None
+
+
+_INSPECTION_REASONS = frozenset({
+    "LAUNCH_PENDING", "MARKER_STAGING_PRESENT", "UNEXPECTED_CONTENT",
+    "MARKER_MISSING", "MARKER_INVALID", "RECOVERY_CHECK_REQUIRED",
+    "ENTRY_UNSAFE", "UNRECOGNIZED_ENTRY", "RECOVERY_LOCK_PRESENT",
+    "LOCK_WITHOUT_DIRECTORY",
+})
+_INSPECTION_LOCKS = frozenset({"ABSENT", "UNSAFE", "PRESENT_UNCHECKED", "NOT_APPLICABLE"})
+
+
+def redacted_recovery_inspection(rows: Any) -> dict[str, Any]:
+    """Independent fixed schema; never route/cleanup/termination authority."""
+    valid = isinstance(rows, (list, tuple)) and len(rows) <= 256
+    public = []
+    if valid:
+        for row in rows:
+            if not isinstance(row, Mapping):
+                valid = False
+                break
+            number = _number(row.get("line_number"), lower=1, upper=256)
+            reason = _enum(row.get("reason"), _INSPECTION_REASONS)
+            lock = _enum(row.get("lock_state"), _INSPECTION_LOCKS)
+            if number != len(public) + 1 or reason is None or lock is None:
+                valid = False
+                break
+            public.append({"line_number": number, "reason": reason, "lock_state": lock})
+    return {
+        "schema_version": 1, "mode": "RECOVERY_INSPECTION",
+        "inspection_status": "COMPLETE" if valid else "FAILED",
+        "error_code": None if valid else "PUBLIC_SCHEMA_REJECTED",
+        "cleanup_performed": False, "process_signals_sent": False,
+        "process_identity_checked": False, "recovery_authorized": False,
+        "rows": public if valid else [],
+    }

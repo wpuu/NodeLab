@@ -8,6 +8,7 @@ error code. The private RunContext owns configuration removal separately.
 from __future__ import annotations
 
 import hashlib
+import math
 import os
 import select
 import signal
@@ -146,13 +147,69 @@ def process_identity(pid: int) -> ProcessIdentity | None:
     return None  # no reliable creation stamp here: callers must not kill
 
 
+def _recovery_identity(value: ProcessIdentity | None) -> bool:
+    return (type(value) is ProcessIdentity
+            and type(value.pid) is int and value.pid > 0
+            and type(value.create_time) is int and value.create_time > 0
+            and (value.exe_fingerprint is None or
+                 (type(value.exe_fingerprint) is str and len(value.exe_fingerprint) == 32
+                  and all(c in "0123456789abcdef" for c in value.exe_fingerprint))))
+
+
+
+def linux_owner_gone(expected: ProcessIdentity) -> bool:
+    """Read-only recovery proof: unknown owner is NOT permission to proceed.
+
+    A different executable with the same creation stamp may be exec(), not
+    owner death. Only kernel absence/readiness or a known different creation
+    stamp establishes that this recorded owner is no longer the live owner.
+    """
+    if not _recovery_identity(expected) or not hasattr(os, "pidfd_open"):
+        return False
+    try:
+        fd = os.pidfd_open(expected.pid)
+    except ProcessLookupError:
+        return True
+    except (OSError, ValueError, OverflowError):
+        return False
+    try:
+        def exited() -> bool:
+            ready, _, _ = select.select([fd], [], [], 0.0)
+            return bool(ready)
+
+        if exited():
+            return True
+        current = _linux_identity(expected.pid)
+        if (_recovery_identity(current) and current.pid == expected.pid
+                and current.create_time != expected.create_time):
+            return True
+        # Missing /proc data, missing executable data, or exec with the same
+        # PID/start stamp does not prove exit. Recheck only the bound pidfd.
+        return exited()
+    except (OSError, ValueError):
+        return False
+    finally:
+        os.close(fd)
+
+
 def terminate_verified_process(expected: ProcessIdentity, *, budget: float = STOP_BUDGET_SECONDS) -> bool:
     """Terminate a pid only while it still is exactly `expected`; True when gone.
 
-    An identity mismatch means the recorded child already exited (and the pid
-    may belong to someone else), so nothing is signalled.
+    On Linux, a known different creation stamp means the recorded child
+    exited; a changed executable alone may be exec(), not death. Linux recovery
+    requires pidfd APIs and a complete matching fingerprint before signalling;
+    an unreadable identity is not itself proof of exit.
     """
-    deadline = time.monotonic() + budget
+    if not _recovery_identity(expected) or type(budget) not in (int, float):
+        return False
+    try:
+        if not math.isfinite(budget) or budget <= 0:
+            return False
+        deadline = time.monotonic() + budget
+        if not math.isfinite(deadline):
+            return False
+    except OverflowError:
+        return False
     if os.name == "nt":
         proc = _WindowsProcess(expected.pid, terminate=True)
         try:
@@ -163,52 +220,63 @@ def terminate_verified_process(expected: ProcessIdentity, *, budget: float = STO
             proc.close()
     if not os.path.isdir("/proc"):
         return False  # cannot verify identity on this platform: leave it alone
-    pidfd = None
+    # A recovery record is not a Popen owner. Never fall back to os.kill(pid):
+    # the PID can be reused after the identity query. Older kernels/Pythons or
+    # denied pidfd access require review rather than weaker termination.
+    if not hasattr(os, "pidfd_open") or not hasattr(signal, "pidfd_send_signal"):
+        return False
     try:
-        if hasattr(os, "pidfd_open"):
+        pidfd = os.pidfd_open(expected.pid)
+    except ProcessLookupError:
+        return True  # kernel-confirmed absence, not an unreadable /proc record
+    except (OSError, OverflowError, ValueError):
+        return False
+    try:
+        def exited(timeout: float = 0.0) -> bool:
+            ready, _, _ = select.select([pidfd], [], [], max(0.0, timeout))
+            return bool(ready)
+
+        if exited():
+            return True
+        current = _linux_identity(expected.pid)
+        if not _recovery_identity(current):
+            return exited()  # None also means permission/read errors, NOT gone
+        if current.pid != expected.pid:
+            return exited()  # inconsistent lookup is not proof of PID reuse
+        if current.create_time != expected.create_time:
+            return True  # known different lifetime: leave it untouched
+        if (expected.exe_fingerprint is None or current.exe_fingerprint is None
+                or expected.exe_fingerprint != current.exe_fingerprint):
+            # The same process can exec a different image. Do not signal it,
+            # but do not erase its recovery evidence by claiming it is gone.
+            return exited()
+
+        # After binding, only descriptor readiness or ESRCH confirms exit;
+        # a later unreadable /proc record must not turn into successful cleanup.
+        for sig, cap in ((signal.SIGTERM, 3.0), (signal.SIGKILL, budget)):
+            left = deadline - time.monotonic()
+            if left <= 0:
+                return exited()
+            if exited():
+                return True
+            current = _linux_identity(expected.pid)
+            if not _recovery_identity(current) or current != expected:
+                # Reuse, exec or an unreadable view after binding is not a
+                # fresh authorization to signal or proof the bound task died.
+                return exited()
+            if deadline - time.monotonic() <= 0:
+                return exited()  # identity lookup consumes the same budget
             try:
-                pidfd = os.pidfd_open(expected.pid)
-            except OSError:
-                pidfd = None
-        if not expected.matches(_linux_identity(expected.pid)):
-            return True
-
-        def send(sig: int) -> None:
-            if pidfd is not None and hasattr(signal, "pidfd_send_signal"):
-                signal.pidfd_send_signal(pidfd, sig)  # bound to this process, not the pid number
-            else:
-                os.kill(expected.pid, sig)
-
-        def gone(timeout: float) -> bool:
-            end = time.monotonic() + timeout
-            while True:
-                if pidfd is not None:
-                    ready, _, _ = select.select([pidfd], [], [], max(0.0, min(0.2, end - time.monotonic())))
-                    if ready:
-                        return True
-                if not expected.matches(_linux_identity(expected.pid)):
-                    return True
-                if time.monotonic() >= end:
-                    return False
-                if pidfd is None:
-                    time.sleep(0.05)
-
-        try:
-            send(signal.SIGTERM)
-        except ProcessLookupError:
-            return True
-        if gone(min(3.0, max(0.1, deadline - time.monotonic()))):
-            return True
-        try:
-            send(signal.SIGKILL)
-        except ProcessLookupError:
-            return True
-        return gone(max(0.1, deadline - time.monotonic()))
-    except OSError:
-        return not expected.matches(_linux_identity(expected.pid))
+                signal.pidfd_send_signal(pidfd, sig)
+            except ProcessLookupError:
+                return True
+            if exited(min(cap, max(0.0, deadline - time.monotonic()))):
+                return True
+        return False
+    except (OSError, ValueError):
+        return False
     finally:
-        if pidfd is not None:
-            os.close(pidfd)
+        os.close(pidfd)
 
 
 def find_mihomo_exe() -> Path | None:
@@ -242,10 +310,14 @@ def stop_owned_process(proc: subprocess.Popen, *, budget: float = STOP_BUDGET_SE
     The whole terminate -> kill -> fallback sequence shares one bounded budget
     (default 5 s, the contract's cleanup window) instead of stacking timeouts.
     """
+    if (type(budget) not in (int, float) or not math.isfinite(budget)
+            or budget <= 0):
+        raise ProcessLifecycleError()
     deadline = time.monotonic() + budget
 
     def remaining(cap: float) -> float:
-        return max(0.1, min(cap, deadline - time.monotonic()))
+        # Never grant a new minimum timeout after the shared budget expired.
+        return max(0.0, min(cap, deadline - time.monotonic()))
 
     try:
         if proc.poll() is None:
@@ -260,6 +332,7 @@ def stop_owned_process(proc: subprocess.Popen, *, budget: float = STOP_BUDGET_SE
             raise ProcessLifecycleError()
     except BaseException:
         # Cancellation during cleanup must not leave our own child alive.
+        # Last-resort kill does not reset the deadline, even at budget expiry.
         try:
             if proc.poll() is None:
                 proc.kill()

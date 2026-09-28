@@ -49,9 +49,17 @@ def decide_probe_status(
     A validated public exit IP is returned privately only after both sources
     agree; the public serializer deliberately has no confirmed-IP field.
     """
+    if any(type(flag) is not bool for flag in (unsupported, hard_failure, production)):
+        return "FAIL", None
+    if cleanup_ok is not True or hard_failure:
+        return "FAIL", None
     if unsupported:
-        return "UNSUPPORTED", None
-    if runtime_verified is not True or cleanup_ok is not True or hard_failure:
+        # UNSUPPORTED belongs before process/network work, not after observations
+        # have been collected. It must never hide failed cleanup or route facts.
+        return ("UNSUPPORTED", None) if source_a is None and source_b is None else ("FAIL", None)
+    if runtime_verified is not True:
+        return "FAIL", None
+    if any(item is not None and type(item) is not RouteObservation for item in (source_a, source_b)):
         return "FAIL", None
     if (source_a and source_a.direct_seen) or (source_b and source_b.direct_seen):
         return "FAIL", None
@@ -62,8 +70,10 @@ def decide_probe_status(
                 or observation.http_ok is not True or not isinstance(observation.ip, str)):
             return None
         try:
+            if "%" in observation.ip:
+                return None
             address = ipaddress.ip_address(observation.ip)
-            if production and not address.is_global:
+            if address.is_multicast or (production and not address.is_global):
                 return None
             return address
         except ValueError:

@@ -2,13 +2,15 @@
 
 The former sing-box-shaped config generator is intentionally unavailable
 until F2 implements the fixed Mihomo v1.19.31 schema.  This module currently
-provides only a protected temporary run and exact-child ownership for
-synthetic safety tests; it is not authority to probe a real node.
+provides a protected temporary run and exact-child ownership for synthetic
+safety tests and the internal F2 engine session; it is not authority to probe
+a real node.
 """
 
 from __future__ import annotations
 
 import base64
+import errno
 import hashlib
 import json
 import os
@@ -20,14 +22,16 @@ import subprocess
 import sys
 import tempfile
 import time
+from contextlib import contextmanager, nullcontext
 from pathlib import Path
 from typing import Any
+from uuid import UUID
 
 import yaml
 
 from nodelab.mihomo_process import (
     MihomoProcess, ProcessIdentity, ProcessLifecycleError, process_identity,
-    stop_owned_process, terminate_verified_process,
+    stop_owned_process, terminate_verified_process, linux_owner_gone,
 )
 
 PROBE_GROUP = "PROBE"
@@ -35,13 +39,83 @@ DELAY_URL = "https://www.gstatic.com/generate_204"
 _PRIVATE_CODES = frozenset({
     "PRIVATE_DIR_UNSAFE", "RECOVERY_REVIEW_REQUIRED", "CONFIG_BUILD_FAILED",
     "SECRET_CLEANUP_FAILED", "PROBE_GATE_CLOSED", "PROCESS_START_FAILED",
+    "RECOVERY_INSPECTION_UNSUPPORTED", "RECOVERY_INSPECTION_LIMIT", "RECOVERY_INSPECTION_FAILED",
 })
 _WINDOWS_ROOT = Path(r"E:\NodeLab.secrets\_runtime")
 _RUN_ID = re.compile(r"[0-9a-f]{32}\Z")
 _LOCK_SUFFIX = ".lock"
 _RECOVER_LOCK = ".recover" + _LOCK_SUFFIX
 _MARKER = ".owner.json"
+_LAUNCH_PENDING = ".owner-launch.tmp"
 _MARKER_MAX_BYTES = 4096
+_LINUX_BOOT_ID = Path("/proc/sys/kernel/random/boot_id")
+_BOOT_FINGERPRINT = re.compile(r"[0-9a-f]{64}\Z")
+
+
+
+def _read_linux_marker(path: Path) -> str | None:
+    """Validate the opened object and bound the read, not just its pathname.
+
+    NONBLOCK prevents a substituted FIFO from waiting for a writer before
+    fstat can reject it. NOFOLLOW applies to the final component only; this
+    is not protection against arbitrary hostile ancestor replacement.
+    """
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+        try:
+            info = os.fstat(fd)
+            if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid()
+                    or stat.S_IMODE(info.st_mode) != 0o600 or info.st_nlink != 1
+                    or info.st_size > _MARKER_MAX_BYTES):
+                return None
+            data = os.read(fd, _MARKER_MAX_BYTES + 1)
+            if len(data) > _MARKER_MAX_BYTES:
+                return None
+            return data.decode("utf-8", "strict")
+        finally:
+            os.close(fd)
+    except (OSError, ValueError, UnicodeError):
+        return None
+
+
+
+def _valid_linux_child_record(data: dict[str, Any]) -> bool:
+    # Missing keys are not equivalent to the explicit no-child record written
+    # by RunContext. A partial identity must not authorize deletion or signals.
+    fields = ("child_pid", "child_create_time", "child_exe_fingerprint")
+    if any(key not in data for key in fields):
+        return False
+    pid, stamp, fingerprint = (data[key] for key in fields)
+    if pid is None and stamp is None and fingerprint is None:
+        return True
+    return (type(pid) is int and pid > 0 and type(stamp) is int and stamp > 0
+            and type(fingerprint) is str and len(fingerprint) == 32
+            and all(c in "0123456789abcdef" for c in fingerprint))
+
+
+def _unique_marker_fields(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("RECOVERY_REVIEW_REQUIRED")
+        result[key] = value
+    return result
+
+
+def _linux_boot_fingerprint() -> str | None:
+    """Bounded read of this boot, storing an opaque domain-separated digest."""
+    try:
+        with _LINUX_BOOT_ID.open("rb") as source:
+            data = source.read(65)
+        if len(data) > 64:
+            return None
+        value = data.decode("ascii", "strict").strip()
+        if str(UUID(value)) != value:
+            return None
+        return hashlib.sha256(b"nodelab-linux-boot-v1\0" + value.encode("ascii")).hexdigest()
+    except (OSError, ValueError, UnicodeError):
+        return None
+
 _ACL_CHECK_SCRIPT = r"""
 $ErrorActionPreference = 'Stop'
 $target = [Environment]::GetEnvironmentVariable('NODELAB_PRIVATE_PATH', 'Process')
@@ -191,6 +265,31 @@ def _check_clean_private_tree(path: Path) -> None:
             pending.extend(current.iterdir())
 
 
+
+def _remove_payload_preserving_evidence(path: Path) -> None:
+    """Linux failed-stop cleanup; keep only application recovery metadata.
+
+    Staging files must also remain: deleting them could turn an ambiguous
+    marker publication into an apparently recoverable old record. They are
+    written without credentials, but still require the private directory.
+    """
+    _check_clean_private_tree(path)
+
+    def metadata(entry: Path) -> bool:
+        return entry.is_file() and (entry.name == _MARKER or
+                                   (entry.name.startswith(".owner-") and entry.name.endswith(".tmp")))
+
+    for entry in sorted(path.iterdir(), key=lambda p: p.name != "probe.yaml"):
+        if metadata(entry):
+            continue
+        if entry.is_dir():
+            shutil.rmtree(entry)
+        else:
+            entry.unlink()
+    if any(not metadata(entry) for entry in path.iterdir()):
+        raise PrivateRunError("SECRET_CLEANUP_FAILED")
+
+
 def _acquire_lock(path: Path) -> int:
     """Create `path` exclusively and hold an OS lock on it for this process.
 
@@ -239,10 +338,69 @@ def _release_lock(path: Path, fd: int | None) -> None:
     os.close(fd)  # flock is released with the descriptor
 
 
+
+def _linux_lock_metadata(info: os.stat_result) -> bool:
+    """Only this application's empty, private, single-link regular locks."""
+    return (stat.S_ISREG(info.st_mode) and info.st_uid == os.getuid()
+            and stat.S_IMODE(info.st_mode) == 0o600 and info.st_nlink == 1
+            and info.st_size == 0)
+
+
+
+def _linux_recovery_lock_matches(path: Path, fd: int) -> bool:
+    held, named = os.fstat(fd), path.lstat()
+    return (_linux_lock_metadata(held) and _linux_lock_metadata(named)
+            and (held.st_dev, held.st_ino) == (named.st_dev, named.st_ino))
+
+
+def _acquire_linux_recovery_lock(path: Path, *, create: bool = True, exclusive: bool = False) -> int:
+    """Take an existing stale inode directly; never unlink before acquiring.
+
+    An opener that raced the previous holder's unlink may own an unlinked old
+    inode. Revalidate AFTER flock, before granting access to recovery actions.
+    """
+    import fcntl
+
+    flags = os.O_RDWR | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK
+    if create:
+        flags |= os.O_CREAT
+    if exclusive:
+        flags |= os.O_EXCL
+    fd = os.open(path, flags, 0o600)
+    try:
+        if not _linux_lock_metadata(os.fstat(fd)):
+            raise PrivateRunError("RECOVERY_REVIEW_REQUIRED")
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        if not _linux_recovery_lock_matches(path, fd):
+            raise PrivateRunError("RECOVERY_REVIEW_REQUIRED")
+        return fd
+    except FileNotFoundError:
+        os.close(fd)
+        raise PrivateRunError("RECOVERY_REVIEW_REQUIRED") from None
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+def _release_linux_recovery_lock(path: Path, fd: int) -> None:
+    try:
+        # Do not knowingly unlink a replacement lock. This check/unlink pair
+        # is not an atomic defence against a hostile same-identity writer.
+        if not _linux_recovery_lock_matches(path, fd):
+            raise PrivateRunError("RECOVERY_REVIEW_REQUIRED")
+        path.unlink()
+    except (OSError, ValueError):
+        raise PrivateRunError("RECOVERY_REVIEW_REQUIRED") from None
+    finally:
+        os.close(fd)
+
+
 def _lock_state(path: Path) -> str:
     """'live' (held by a running process), 'stale' (nobody holds it), 'missing' or 'unsafe'."""
     try:
         if _is_reparse(path):
+            return "unsafe"
+        if sys.platform == "linux" and not _linux_lock_metadata(path.lstat()):
             return "unsafe"
     except FileNotFoundError:
         return "missing"
@@ -273,18 +431,34 @@ def _lock_state(path: Path) -> str:
             os.close(fd)
     import fcntl
 
+    flags = os.O_RDWR | os.O_CLOEXEC | os.O_NOFOLLOW
+    if sys.platform == "linux":
+        flags |= os.O_NONBLOCK
     try:
-        fd = os.open(path, os.O_RDWR | os.O_CLOEXEC | os.O_NOFOLLOW)
+        fd = os.open(path, flags)
     except FileNotFoundError:
         return "missing"
     except OSError:
         return "unsafe"
     try:
+        if sys.platform == "linux":
+            try:
+                if not _linux_lock_metadata(os.fstat(fd)):
+                    return "unsafe"
+            except OSError:
+                return "unsafe"
         try:
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as error:
+            if sys.platform != "linux" or error.errno in {errno.EAGAIN, errno.EWOULDBLOCK}:
+                return "live"
+            return "unsafe"
+        try:
+            fcntl.flock(fd, fcntl.LOCK_UN)
         except OSError:
-            return "live"
-        fcntl.flock(fd, fcntl.LOCK_UN)
+            if sys.platform != "linux":
+                raise
+            return "unsafe"
         return "stale"
     finally:
         os.close(fd)
@@ -330,6 +504,25 @@ def _classify_root_entries(root: Path) -> tuple[int, list[Path]]:
     return live, review
 
 
+@contextmanager
+def _linux_startup_admission(root: Path):
+    """Serialize startup publication with recovery; never take over residue."""
+    lock = root / _RECOVER_LOCK
+    try:
+        fd = _acquire_linux_recovery_lock(lock, exclusive=True)
+    except (OSError, ValueError, PrivateRunError):
+        raise PrivateRunError("RECOVERY_REVIEW_REQUIRED") from None
+    try:
+        # The first scan preceded admission and may already be obsolete.
+        # Only our own root lock is excluded; live run locks remain allowed.
+        _live, review = _classify_root_entries(root)
+        if any(entry.name != _RECOVER_LOCK for entry in review):
+            raise PrivateRunError("RECOVERY_REVIEW_REQUIRED")
+        yield
+    finally:
+        _release_linux_recovery_lock(lock, fd)
+
+
 class RunContext:
     """Single owner for one private YAML and one exact Popen object.
 
@@ -353,7 +546,13 @@ class RunContext:
         self.process: MihomoProcess | None = None
         self.raw_child: subprocess.Popen | None = None
         self._windows_owner_sid: str | None = None
+        self._linux_boot: str | None = None
+        self._initial_dir_fd: int | None = None
+        self._run_dir_fd: int | None = None
+        self._failed_enter = False
+        self._failed_enter_clean = False
         self._private_tree_removed = False
+        self._launch_unclaimed = False
         self._lock_path: Path | None = None
         self._lock_fd: int | None = None
         self.active = False
@@ -408,10 +607,21 @@ class RunContext:
 
     def _write_marker(self, *, child: ProcessIdentity | None = None) -> None:
         assert self.run_dir is not None and self.run_id is not None
+        if sys.platform == "linux":
+            current_boot = _linux_boot_fingerprint()
+            if (current_boot is None or
+                    (self._linux_boot is not None and current_boot != self._linux_boot)):
+                raise PrivateRunError("RECOVERY_REVIEW_REQUIRED")
+            self._linux_boot = current_boot
         marker = self.run_dir / _MARKER
-        if not marker.exists():
-            self._new_file(_MARKER)
-        self._verify(marker, directory=False)
+        if sys.platform == "linux":
+            self._verify(self.run_dir, directory=True)
+            if marker.exists() or marker.is_symlink():
+                self._verify(marker, directory=False)
+        else:
+            if not marker.exists():
+                self._new_file(_MARKER)
+            self._verify(marker, directory=False)
         owner = process_identity(os.getpid())
         # No credentials, URI, hostname, EXE path, or controller token here:
         # only what recovery needs to prove "same process" and "same dir".
@@ -425,27 +635,76 @@ class RunContext:
             "child_create_time": child.create_time if child else None,
             "child_exe_fingerprint": child.exe_fingerprint if child else None,
         }
-        with marker.open("w", encoding="utf-8") as f:
-            json.dump(value, f, sort_keys=True)
+        if sys.platform == "linux":
+            value["linux_boot_fingerprint"] = self._linux_boot
+        if sys.platform == "linux":
+            self._publish_linux_marker(marker, value)
+        else:
+            with marker.open("w", encoding="utf-8") as f:
+                json.dump(value, f, sort_keys=True)
+                f.flush()
+                os.fsync(f.fileno())
+
+    def _publish_linux_marker(self, marker: Path, value: dict[str, Any]) -> None:
+        # Same-directory exclusive 0600 staging: interrupted serialization
+        # cannot truncate the preceding complete record. A crash may leave a
+        # staging file, which the existing recovery allowlist sends to review.
+        fd, name = tempfile.mkstemp(prefix=".owner-", suffix=".tmp", dir=self.run_dir)
+        temporary = Path(name)
+        try:
+            stream = os.fdopen(fd, "w", encoding="utf-8")
+            fd = None  # stream now owns the descriptor even on serialization failure
+            with stream:
+                self._verify(temporary, directory=False)
+                json.dump(value, stream, sort_keys=True)
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temporary, marker)
+            temporary = None  # publication happened; never unlink the new marker
+            self._verify(marker, directory=False)
+            directory_fd = os.open(self.run_dir, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
+        finally:
+            try:
+                if fd is not None:
+                    os.close(fd)
+            finally:
+                if temporary is not None:
+                    temporary.unlink(missing_ok=True)
 
     def __enter__(self) -> "RunContext":
-        if self.active or self.closed or self.run_dir is not None:
+        if self.active or self.closed or self.run_dir is not None or self._failed_enter:
             raise PrivateRunError()
         try:
             self._ensure_root()
-            self.run_id = secrets.token_hex(16)
-            # Lock first, then mkdir: a concurrent scanner therefore never
-            # sees a run directory whose lock is not yet held.
-            self._lock_path = self.root / (self.run_id + _LOCK_SUFFIX)
-            self._lock_fd = _acquire_lock(self._lock_path)
-            self.run_dir = self.root / self.run_id
-            self.run_dir.mkdir(mode=0o700)
-            if os.name == "nt":
-                _restrict_new_windows(self.run_dir, self._windows_owner_sid, directory=True)
-            else:
-                self._verify(self.run_dir, directory=True)
-            self.active = True
-            self._write_marker()
+            admission = (_linux_startup_admission(self.root)
+                         if sys.platform == "linux" else nullcontext())
+            with admission:
+                self.run_id = secrets.token_hex(16)
+                # Lock first, then mkdir: a concurrent scanner therefore never
+                # sees a run directory whose lock is not yet held.
+                self._lock_path = self.root / (self.run_id + _LOCK_SUFFIX)
+                self._lock_fd = _acquire_lock(self._lock_path)
+                self.run_dir = self.root / self.run_id
+                self.run_dir.mkdir(mode=0o700)
+                if sys.platform == "linux":
+                    # Only after successful mkdir; pin the inode through all
+                    # initialization and root-admission release failure paths.
+                    self._initial_dir_fd = os.open(
+                        self.run_dir, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+                if os.name == "nt":
+                    _restrict_new_windows(self.run_dir, self._windows_owner_sid, directory=True)
+                else:
+                    self._verify(self.run_dir, directory=True)
+                self.active = True
+                self._write_marker()
+            if sys.platform == "linux":
+                # Retain the same inode, not a reopened pathname. dup is
+                # non-inheritable; the temporary initialization fd closes below.
+                self._run_dir_fd = os.dup(self._initial_dir_fd)
             return self
         except PrivateRunError:
             self._cleanup_empty_failed_enter()
@@ -453,8 +712,39 @@ class RunContext:
         except (OSError, ValueError, subprocess.SubprocessError):
             self._cleanup_empty_failed_enter()
             raise PrivateRunError() from None
+        except BaseException:
+            if sys.platform == "linux":
+                self._cleanup_empty_failed_enter()
+            raise
+        finally:
+            if self._initial_dir_fd is not None:
+                fd, self._initial_dir_fd = self._initial_dir_fd, None
+                os.close(fd)
 
     def _cleanup_empty_failed_enter(self) -> None:
+        if sys.platform == "linux":
+            self._failed_enter = True
+            self._failed_enter_clean = self.run_dir is None
+            try:
+                if self.run_dir is not None and self._initial_dir_fd is not None:
+                    held, named = os.fstat(self._initial_dir_fd), self.run_dir.lstat()
+                    self._verify(self.run_dir, directory=True)
+                    if (stat.S_ISDIR(held.st_mode) and held.st_uid == os.getuid()
+                            and stat.S_IMODE(held.st_mode) == 0o700
+                            and (held.st_dev, held.st_ino) == (named.st_dev, named.st_ino)):
+                        shutil.rmtree(self.run_dir)
+                        self._failed_enter_clean = not (self.run_dir.exists() or self.run_dir.is_symlink())
+            except (OSError, ValueError, PrivateRunError):
+                pass
+            finally:
+                if self._lock_fd is not None:
+                    fd, self._lock_fd = self._lock_fd, None
+                    try:
+                        _release_linux_recovery_lock(self._lock_path, fd)
+                    except (OSError, ValueError, PrivateRunError):
+                        self._failed_enter_clean = False
+                self.active = False
+            return
         if self.run_dir is not None:
             try:
                 if self.run_dir.is_dir() and not _is_reparse(self.run_dir):
@@ -477,7 +767,8 @@ class RunContext:
         attempt, contract F.4); the existing file is re-verified as ours and
         truncated, never followed through a link.
         """
-        if not self.active or self.run_dir is None or not isinstance(value, dict):
+        if (not self.active or self.run_dir is None or not isinstance(value, dict)
+                or self.raw_child is not None or self._launch_unclaimed):
             raise PrivateRunError()
         try:
             path = self.run_dir / "probe.yaml"
@@ -499,23 +790,123 @@ class RunContext:
             # PyYAML/custom mapping errors may themselves contain a secret.
             raise PrivateRunError("CONFIG_BUILD_FAILED") from None
 
+    def _sync_run_directory(self) -> None:
+        fd = os.open(self.run_dir, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+
+    def _begin_linux_launch(self) -> None:
+        if sys.platform != "linux":
+            return
+        self._verify(self.run_dir, directory=True)
+        pending = self.run_dir / _LAUNCH_PENDING
+        fd = os.open(pending, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+        try:
+            stream = os.fdopen(fd, "w", encoding="utf-8")
+            fd = None
+            with stream:
+                self._verify(pending, directory=False)
+                stream.write('{"state":"launch_pending"}\n')
+                stream.flush()
+                os.fsync(stream.fileno())
+            self._sync_run_directory()
+        finally:
+            if fd is not None:
+                os.close(fd)
+
+    def _complete_linux_launch(self) -> None:
+        if sys.platform == "linux":
+            # Only after the child marker has been fully published. If this
+            # fails, the exact Popen is still owned for normal cleanup.
+            (self.run_dir / _LAUNCH_PENDING).unlink()
+            self._sync_run_directory()
+
+    def _spawn_engine(self, exe: Path, *, config_test: bool = False) -> subprocess.Popen:
+        """Internal: own the child immediately, before wrapper/marker work.
+
+        The session verifies the pinned executable first. Only the fixed
+        private YAML path and fixed engine flags can be passed here.
+        """
+        if (not self.active or self.closed or self.run_dir is None
+                or self.raw_child is not None or self.process is not None or self._launch_unclaimed):
+            raise PrivateRunError("PROCESS_START_FAILED")
+        try:
+            path = self.run_dir / "probe.yaml"
+            self._verify(self.run_dir, directory=True)
+            if _is_reparse(path):
+                raise PrivateRunError()
+            self._verify(path, directory=False)
+            command = [str(exe)] + (["-t"] if config_test else [])
+            command += ["-d", str(self.run_dir), "-f", str(path)]
+            self._begin_linux_launch()
+            self._launch_unclaimed = sys.platform == "linux"
+            proc = subprocess.Popen(
+                command, cwd=str(self.run_dir), stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, close_fds=True,
+            )
+            self.raw_child = proc
+            self._launch_unclaimed = False
+            self.process = MihomoProcess(proc)
+            identity = process_identity(proc.pid)
+            if identity is None or identity.exe_fingerprint is None:
+                # A very short-lived -t may already be gone. It needs no
+                # recovery identity, but a live unverifiable child is unsafe.
+                if proc.poll() is None:
+                    raise PrivateRunError("PROCESS_START_FAILED")
+                if sys.platform == "linux":
+                    identity = None  # observed exit, not a partial child record
+            self._write_marker(child=identity)
+            self._complete_linux_launch()
+            return proc
+        except PrivateRunError:
+            raise
+        except Exception:
+            raise PrivateRunError("PROCESS_START_FAILED") from None
+
+    def _finish_engine_check(self) -> None:
+        """Reap -t before clearing its marker and allowing a runtime child."""
+        if self.raw_child is None or self.raw_child.poll() is None:
+            raise PrivateRunError("PROCESS_START_FAILED")
+        if not self._stop_child():
+            raise PrivateRunError("SECRET_CLEANUP_FAILED")
+        try:
+            self._write_marker()
+        except PrivateRunError:
+            raise
+        except Exception:
+            raise PrivateRunError("PROCESS_START_FAILED") from None
+        self.process = None
+        self.raw_child = None
+
     def spawn_synthetic_process(self) -> subprocess.Popen:
         """F1 synthetic child only, for proving own-PID cleanup without Mihomo."""
-        if not self.active or self.run_dir is None or self.process is not None:
+        if (not self.active or self.closed or self.run_dir is None or self.process is not None
+                or self.raw_child is not None or self._launch_unclaimed):
             raise PrivateRunError()
         try:
             env = {k: v for k, v in os.environ.items() if k.upper() in {
                 "SYSTEMROOT", "WINDIR", "PATH", "PYTHONHOME", "PYTHONPATH",
             }}
             flags = 0x08000000 if os.name == "nt" else 0
+            self._begin_linux_launch()
+            self._launch_unclaimed = sys.platform == "linux"
             proc = subprocess.Popen(
                 [sys.executable, "-c", "import time; time.sleep(60)"], cwd=self.run_dir,
                 stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                 env=env, creationflags=flags,
             )
             self.raw_child = proc  # retain ownership even if wrapper/marker raises
+            self._launch_unclaimed = False
             self.process = MihomoProcess(proc)
-            self._write_marker(child=process_identity(proc.pid))
+            identity = process_identity(proc.pid)
+            if sys.platform == "linux" and (identity is None or identity.exe_fingerprint is None):
+                if proc.poll() is None:
+                    raise PrivateRunError("PROCESS_START_FAILED")
+                identity = None
+            self._write_marker(child=identity)
+            self._complete_linux_launch()
             return proc
         except PrivateRunError:
             raise
@@ -524,6 +915,8 @@ class RunContext:
 
     def _stop_child(self) -> bool:
         """Stop only the exact owned child; report, never raise."""
+        if self._launch_unclaimed and self.raw_child is None:
+            return False  # constructor may have created a child before raising
         try:
             if self.process is not None:
                 self.process.close()
@@ -532,6 +925,15 @@ class RunContext:
         except (OSError, ValueError, ProcessLifecycleError):
             return False
         return True
+
+    def _linux_run_directory_matches(self) -> bool:
+        if self.run_dir is None or self._run_dir_fd is None:
+            return False
+        held, named = os.fstat(self._run_dir_fd), self.run_dir.lstat()
+        return (stat.S_ISDIR(held.st_mode) and stat.S_ISDIR(named.st_mode)
+                and held.st_uid == named.st_uid == os.getuid()
+                and stat.S_IMODE(held.st_mode) == stat.S_IMODE(named.st_mode) == 0o700
+                and (held.st_dev, held.st_ino) == (named.st_dev, named.st_ino))
 
     def _remove_private_tree(self) -> bool:
         """Delete this run's directory (plaintext YAML first); report, never raise."""
@@ -543,7 +945,11 @@ class RunContext:
             if self.run_dir.parent != self.root or not self.run_dir.is_dir():
                 return False
             self._verify(self.root, directory=True)
+            if sys.platform == "linux" and not self._linux_run_directory_matches():
+                return False
             _check_clean_private_tree(self.run_dir)
+            if sys.platform == "linux" and not self._linux_run_directory_matches():
+                return False
             # rmtree unlinks files before their directory, so probe.yaml is
             # gone even if the directory itself is still a live child's cwd.
             shutil.rmtree(self.run_dir)
@@ -554,23 +960,71 @@ class RunContext:
         self._private_tree_removed = True
         return True
 
+    def _remove_private_payload(self) -> bool:
+        """On Linux unknown stop, keep evidence without claiming tree removal."""
+        if self.run_dir is None:
+            return False
+        try:
+            if self.run_dir.parent != self.root:
+                return False
+            self._verify(self.root, directory=True)
+            self._verify(self.run_dir, directory=True)
+            if sys.platform == "linux" and not self._linux_run_directory_matches():
+                return False
+            _remove_payload_preserving_evidence(self.run_dir)
+        except (OSError, ValueError, PrivateRunError):
+            return False
+        return True
+
     def close(self) -> None:
         if self.closed:
+            return
+        if sys.platform == "linux" and self._failed_enter:
+            # No initialized context or child exists. Never let a later close
+            # re-enter ordinary pathname-based cleanup after ownership failed.
+            if not self._failed_enter_clean:
+                raise PrivateRunError("SECRET_CLEANUP_FAILED") from None
+            self.closed = True
             return
         if self.run_dir is None:
             self.closed = True
             return
         # Stop the child first (contract E2), but a stop failure must never
-        # skip deleting the plaintext: an orphaned synthetic child is far less
-        # harmful than a credential left on disk.  Both steps always run and
-        # a single fixed code reports if either one is not confirmed.
-        stopped = self._stop_child()
-        removed = self._remove_private_tree()
+        # skip deleting the plaintext. On Linux an unknown stop keeps the
+        # non-secret recovery evidence, so a later owner crash need not lose
+        # the last child identity. Neither payload removal nor retained
+        # evidence is a successful close; the lock stays owned for retry.
+        stopped = removed = False
+        try:
+            try:
+                stopped = self._stop_child() is True
+            except BaseException:
+                # An unexpected wrapper error or cancellation must not bypass
+                # the plaintext deletion attempt. Unknown stop remains FAIL;
+                # do not reset its stop budget or kill a guessed replacement.
+                pass
+        finally:
+            try:
+                if not stopped and sys.platform == "linux":
+                    removed = self._remove_private_payload() is True
+                else:
+                    removed = self._remove_private_tree() is True
+            except BaseException:
+                pass
         if not (stopped and removed):
             # Never report a prior success if process/file cleanup is unknown.
             # The lock stays held: the residue is still owned, not stale.
-            raise PrivateRunError("SECRET_CLEANUP_FAILED")
-        self._drop_lock()
+            # Suppress even an earlier body exception that may contain secrets.
+            raise PrivateRunError("SECRET_CLEANUP_FAILED") from None
+        try:
+            self._drop_lock()
+            if self._run_dir_fd is not None:
+                fd, self._run_dir_fd = self._run_dir_fd, None
+                os.close(fd)
+        except BaseException:
+            # Lock release may have partially completed. Do not claim closed
+            # or echo the underlying exception; a later close can retry.
+            raise PrivateRunError("SECRET_CLEANUP_FAILED") from None
         self.closed = True
         self.active = False
 
@@ -609,17 +1063,34 @@ class _Recovery:
         if not marker.is_file() or _is_reparse(marker) or marker.stat().st_size > _MARKER_MAX_BYTES:
             return None
         self.verify(marker, directory=False)
-        data = json.loads(marker.read_text(encoding="utf-8"))
+        try:
+            text = (_read_linux_marker(marker) if sys.platform == "linux"
+                    else marker.read_text(encoding="utf-8"))
+            if text is None:
+                return None
+            data = json.loads(text, object_pairs_hook=_unique_marker_fields)
+        except (ValueError, UnicodeError, RecursionError):
+            return None
         if not isinstance(data, dict) or data.get("run_id") != run_dir.name:
             return None
         if data.get("run_dir_fingerprint") != _dir_fingerprint(run_dir):
             return None
+        if sys.platform == "linux":
+            recorded = data.get("linux_boot_fingerprint")
+            current = _linux_boot_fingerprint()
+            # Legacy/unreadable/other-boot records cannot authorize PID lookup,
+            # signalling or automatic removal. Never silently rebind them.
+            if (type(recorded) is not str or not _BOOT_FINGERPRINT.fullmatch(recorded)
+                    or current is None or recorded != current):
+                return None
         for key in ("owner_pid", "child_pid", "owner_create_time", "child_create_time"):
             if data.get(key) is not None and type(data.get(key)) is not int:
                 return None
         for key in ("owner_exe_fingerprint", "child_exe_fingerprint"):
             if data.get(key) is not None and type(data.get(key)) is not str:
                 return None
+        if sys.platform == "linux" and not _valid_linux_child_record(data):
+            return None
         return data
 
     def recover_dir(self, run_dir: Path) -> str | None:
@@ -630,30 +1101,80 @@ class _Recovery:
         entries = {entry.name for entry in run_dir.iterdir()}
         if not entries <= {_MARKER, "probe.yaml"}:
             return "RECOVERY_REVIEW_REQUIRED"  # not a tree this application creates
+        if sys.platform == "linux" and _MARKER not in entries:
+            return "RECOVERY_REVIEW_REQUIRED"  # even an empty tree lacks owner evidence
         marker = self.read_marker(run_dir) if _MARKER in entries else None
         if marker is None and _MARKER in entries:
             return "RECOVERY_REVIEW_REQUIRED"
         stop_failed = False
         if marker is not None:
             owner_pid, owner_stamp = marker.get("owner_pid"), marker.get("owner_create_time")
-            if owner_pid is not None and owner_stamp is not None:
+            if sys.platform == "linux":
+                owner = ProcessIdentity(owner_pid, owner_stamp, marker.get("owner_exe_fingerprint"))
+                if linux_owner_gone(owner) is not True:
+                    return "RECOVERY_REVIEW_REQUIRED"
+            elif owner_pid is not None and owner_stamp is not None:
                 owner = ProcessIdentity(owner_pid, owner_stamp, marker.get("owner_exe_fingerprint"))
                 if owner.matches(process_identity(owner_pid)):
                     return "RECOVERY_REVIEW_REQUIRED"  # owner alive without its lock: never touch
             child_pid, child_stamp = marker.get("child_pid"), marker.get("child_create_time")
             if child_pid is not None and child_stamp is not None:
                 child = ProcessIdentity(child_pid, child_stamp, marker.get("child_exe_fingerprint"))
-                stop_failed = not terminate_verified_process(child)
+                try:
+                    stop_failed = terminate_verified_process(child) is not True
+                except BaseException:
+                    if sys.platform != "linux":
+                        raise
+                    # Like owned close, cancellation/unknown stop must not
+                    # bypass plaintext cleanup or erase recovery evidence.
+                    stop_failed = True
             elif child_pid is not None:
                 stop_failed = True  # child recorded but unverifiable: report, never kill
+        if stop_failed and sys.platform == "linux":
+            _remove_payload_preserving_evidence(run_dir)
+            return "PROCESS_STOP_FAILED"
         _check_clean_private_tree(run_dir)
         shutil.rmtree(run_dir)
         if run_dir.exists() or run_dir.is_symlink():
             return "SECRET_CLEANUP_FAILED"
         return "PROCESS_STOP_FAILED" if stop_failed else None
 
+    def _recover_linux_dir_locked(self, run_dir: Path) -> str | None:
+        lock = self.root / (run_dir.name + _LOCK_SUFFIX)
+        try:
+            fd = _acquire_linux_recovery_lock(lock)
+        except (OSError, ValueError, PrivateRunError):
+            return "RECOVERY_REVIEW_REQUIRED"
+        try:
+            code = self.recover_dir(run_dir)
+            if code is None:
+                # Transfer descriptor ownership to release, which closes even
+                # when path verification/unlink fails. Never probe our own lock.
+                held, fd = fd, None
+                _release_linux_recovery_lock(lock, held)
+            return code
+        finally:
+            if fd is not None:
+                # Failed/reviewed recovery keeps a stale lock as evidence,
+                # including one newly created for previously missing locks.
+                os.close(fd)
+
     @staticmethod
     def _remove_stale_lock(lock: Path) -> str | None:
+        if sys.platform == "linux":
+            try:
+                fd = _acquire_linux_recovery_lock(lock, create=False)
+            except FileNotFoundError:
+                # Only absence at open is harmless. Disappearance after open
+                # is ambiguous; acquisition converts that to a review error.
+                return None
+            except (OSError, ValueError, PrivateRunError):
+                return "RECOVERY_REVIEW_REQUIRED"
+            try:
+                _release_linux_recovery_lock(lock, fd)
+            except (OSError, ValueError, PrivateRunError):
+                return "RECOVERY_REVIEW_REQUIRED"
+            return None
         state = _lock_state(lock)
         if state in {"missing", "live"}:
             return None  # nothing left, or (re)acquired by a live run meanwhile
@@ -676,20 +1197,33 @@ class _Recovery:
                     state = _lock_state(entry)  # a lock without a directory
                     if state == "live":
                         continue  # a run started meanwhile; it is not residue
+                    code = None
                     if state == "stale":
-                        entry.unlink()
+                        if sys.platform == "linux":
+                            code = self._remove_stale_lock(entry)
+                        else:
+                            entry.unlink()
                     if state in {"stale", "missing"}:
-                        rows.append(_recovery_row(number, None))
+                        rows.append(_recovery_row(number, code))
                     else:
                         rows.append(_recovery_row(number, "RECOVERY_REVIEW_REQUIRED"))
                     continue
                 if not _RUN_ID.fullmatch(entry.name):
                     rows.append(_recovery_row(number, "RECOVERY_REVIEW_REQUIRED"))
                     continue
-                code = self.recover_dir(entry)
-                if code is None or code == "PROCESS_STOP_FAILED":
-                    lock_code = self._remove_stale_lock(self.root / (entry.name + _LOCK_SUFFIX))
-                    code = code or lock_code
+                if (sys.platform == "linux" and
+                        _lock_state(self.root / (entry.name + _LOCK_SUFFIX)) not in {"missing", "stale"}):
+                    # Classification is not an ownership grant. Unsafe or
+                    # newly held locks must not authorize process/file actions.
+                    rows.append(_recovery_row(number, "RECOVERY_REVIEW_REQUIRED"))
+                    continue
+                if sys.platform == "linux":
+                    code = self._recover_linux_dir_locked(entry)
+                else:
+                    code = self.recover_dir(entry)
+                    if code is None or code == "PROCESS_STOP_FAILED":
+                        lock_code = self._remove_stale_lock(self.root / (entry.name + _LOCK_SUFFIX))
+                        code = code or lock_code
                 rows.append(_recovery_row(number, code))
             except (OSError, ValueError, PrivateRunError, ProcessLifecycleError):
                 rows.append(_recovery_row(number, "SECRET_CLEANUP_FAILED"))
@@ -702,8 +1236,10 @@ def recover_stale_runs(root: Path | None = None) -> list[dict[str, Any]]:
     Only directories this application created (run-id name, verified ACL/
     mode, marker naming this very directory) are touched.  A recorded child
     is terminated only while its pid, creation stamp and executable digest
-    still match the marker; anything unverifiable is reported as
-    RECOVERY_REVIEW_REQUIRED and left alone.  Live runs are skipped.
+    still match the marker. Untrusted records require review and remain
+    untouched. On Linux an unconfirmed child stop removes payload but keeps
+    recovery metadata and reports PROCESS_STOP_FAILED (or cleanup failure).
+    Live runs are skipped.
     Returns one fixed-shape row per handled entry (no paths, no ids).
     """
     probe = RunContext(root)  # applies the same root rules, never enters
@@ -720,6 +1256,15 @@ def recover_stale_runs(root: Path | None = None) -> list[dict[str, Any]]:
     else:
         _verify_posix(root_path, directory=True)
     lock_path = root_path / _RECOVER_LOCK
+    if sys.platform == "linux":
+        try:
+            fd = _acquire_linux_recovery_lock(lock_path)
+        except (OSError, ValueError, PrivateRunError):
+            raise PrivateRunError("RECOVERY_REVIEW_REQUIRED") from None
+        try:
+            return recovery.run()
+        finally:
+            _release_linux_recovery_lock(lock_path, fd)
     try:
         fd = _acquire_lock(lock_path)
     except FileExistsError:

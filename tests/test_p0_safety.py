@@ -279,9 +279,21 @@ def test_s8_popen_failure_still_deletes_yaml(tmp_path: Path, monkeypatch):
         with ctx:
             ctx.write_yaml({"password": sentinel})
             ctx.spawn_synthetic_process()
-    assert info.value.code == "PROCESS_START_FAILED"
-    assert sentinel not in str(info.value)
-    assert not ctx.run_dir.exists()
+    try:
+        code = "SECRET_CLEANUP_FAILED" if sys.platform == "linux" else "PROCESS_START_FAILED"
+        assert info.value.code == code
+        assert sentinel not in str(info.value)
+        assert not (ctx.run_dir / "probe.yaml").exists()
+        if sys.platform == "linux":
+            assert (ctx.run_dir / ".owner-launch.tmp").is_file()
+            assert not ctx.closed and ctx.raw_child is None
+        else:
+            assert not ctx.run_dir.exists()
+    finally:
+        # The injected launcher never creates a child; only fixture teardown
+        # may clear this uncertainty. Real constructor exceptions may not.
+        ctx._launch_unclaimed = False
+        ctx.close()
 
 
 def test_s8_after_popen_wrapper_error_still_owns_exact_child(tmp_path: Path, monkeypatch):
@@ -458,6 +470,12 @@ def test_recovery_never_touches_unverifiable_residue_or_foreign_pids(tmp_path: P
                 ctx.close()  # the synthetic test always cleans its own fixtures
             except PrivateRunError:
                 pass
+    if sys.platform == "linux":
+        # Recovery now creates/retains a run lock even for a missing lock on a
+        # reviewed directory. The original owner cannot release an fd it no
+        # longer owns; explicitly recover these now-orphaned test locks.
+        leftover = recover_stale_runs(abandoned[0].root)
+        assert all(row["error_code"] is None for row in leftover)
     assert not [entry for entry in abandoned[0].root.iterdir()]
 
 
@@ -583,7 +601,11 @@ def test_stop_failure_still_deletes_plaintext_and_reports_cleanup_failure(tmp_pa
         assert info.value.code == "SECRET_CLEANUP_FAILED"
         assert sentinel not in str(info.value)
         # The credential must not outlive the run just because the child did.
-        assert not yaml_path.exists() and not run_dir.exists()
+        assert not yaml_path.exists()
+        if sys.platform == "linux":
+            assert (run_dir / ".owner.json").is_file()  # retain recovery evidence
+        else:
+            assert not run_dir.exists()
         assert not ctx.closed and owned.poll() is None  # honestly still owned, not "closed"
         # A later retry with a stoppable child completes the same run.
         ctx.close()
@@ -639,7 +661,8 @@ def test_p0_07a_verdict_requires_two_route_backed_observations():
                                production=False) == ("FAIL", None)
     assert decide_probe_status(good, good, runtime_verified=True, cleanup_ok=True,
                                production=True) == ("FAIL", None)  # documentation IP, not public
-    assert decide_probe_status(good, good, **(common | {"unsupported": True})) == ("UNSUPPORTED", None)
+    assert decide_probe_status(good, good, **(common | {"unsupported": True})) == ("FAIL", None)
+    assert decide_probe_status(None, None, **(common | {"unsupported": True})) == ("UNSUPPORTED", None)
 
 
 def test_unsafe_parent_or_symlink_never_receives_plaintext(tmp_path: Path):

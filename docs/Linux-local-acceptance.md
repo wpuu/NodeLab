@@ -1,0 +1,221 @@
+# Linux 本机真实引擎验收准备
+
+范围：Linux amd64、本机 fixture，不使用外部节点或真实凭据。文件准备成功不等于运行时、协议或路由验收通过，任何步骤都不开放真实节点门禁。
+
+## 1. 准备官方 Mihomo 压缩包
+
+固定资源：
+
+- 仓库：MetaCubeX/mihomo
+- 标签：`v1.19.31`
+- 文件：`mihomo-linux-amd64-compatible-v1.19.31.gz`
+- 官方 URL：<https://github.com/MetaCubeX/mihomo/releases/download/v1.19.31/mihomo-linux-amd64-compatible-v1.19.31.gz>
+- GitHub release asset ID：`563462721`
+- 压缩包 SHA-256：`04cf9f09671704f839ddbee2e93069dc831a4123a75281e725d1d96ab9ac1afc`
+- 解压后二进制 SHA-256：`b341a765412c192685264e038a6aad2ac1c67c12b8aceeb5c6f64955cf43f5ed`
+
+若当前环境无法下载，可在能连接官方 URL 的环境下载后传入工作区。不要关闭 TLS 校验、使用未知镜像、改 pin 或把 API JSON 元数据当作压缩包。上述摘要是字节/来源固定值，不是上游签名；压缩包摘要与可执行文件摘要不可混用。
+
+从仓库根目录执行，替换压缩包的绝对路径：
+
+```sh
+mkdir -p tools/mihomo
+python3 scripts/prepare_mihomo_linux.py \
+  --archive /absolute/path/to/mihomo-linux-amd64-compatible-v1.19.31.gz \
+  --destination "$PWD/tools/mihomo/mihomo"
+```
+
+准备脚本可在本项目目前的 Python 3.11 环境运行，不依赖第三方包；它不下载、不运行二进制、不查找 PATH、不接受自定义 pin、不覆盖已有目的文件。父目录必须已存在、不经过符号链接且不能被组或其他用户写入；输入文件必须是普通文件。
+
+脚本先将输入复制为有大小限制的私有快照并校验压缩包摘要，再从该快照有限解压、校验二进制摘要，以权限 `0700` 和不覆盖的 hard link 发布。成功 JSON 为 `PREPARED / PINNED_BYTES_PREPARED`，`binary_executed=false`，`runtime_acceptance=NOT_RUN`。
+
+错误时退出码为 2，并只输出固定错误码，不回显路径。`DESTINATION_EXISTS` 时保留原文件，不要自动删除它；先确认所有权及内容。`CANCELLED_REVIEW_DESTINATION` 或进程被杀后须检查目的文件和暂存目录：可能已经发布已校验文件。脚本不是崩溃恢复或敌对并发文件系统的安全边界，不保证断电持久性；父路径不得被其他进程并发替换。
+
+## 2. 准备受支持 Python 和测试依赖
+
+验收仍要求 **Python 3.12+**。准备脚本能在 3.11 运行不放宽这个要求。使用可信来源的现有 Python 3.12+ 创建隔离环境，例如：
+
+```sh
+python3.12 -m venv tools/runtime/acceptance
+tools/runtime/acceptance/bin/python -m pip install -e . pytest
+```
+
+本机协议测试还需要 `openssl` 命令生成临时测试证书。这里不提供未知来源 Python 安装器，也不修改主机信任库。`tools/` 已被 Git 忽略，不提交运行时、压缩包、二进制或环境依赖。
+
+## 3. 逐套执行 gate
+
+```sh
+tools/runtime/acceptance/bin/python scripts/f2_session_gate.py \
+  --suite session --exe "$PWD/tools/mihomo/mihomo"
+tools/runtime/acceptance/bin/python scripts/f2_session_gate.py \
+  --suite trojan-tcp --exe "$PWD/tools/mihomo/mihomo"
+tools/runtime/acceptance/bin/python scripts/f2_session_gate.py \
+  --suite vless-tcp --exe "$PWD/tools/mihomo/mihomo"
+tools/runtime/acceptance/bin/python scripts/f2_session_gate.py \
+  --suite full --exe "$PWD/tools/mihomo/mihomo"
+```
+
+- `session`：精确 11 个用例通过且零 skip；合成会话范围，不是实际代理协议证明。
+- `trojan-tcp`：精确 4 个用例通过且零 skip；实际本机 Trojan/TLS/TCP。
+- `vless-tcp`：精确 4 个用例通过且零 skip；实际本机 VLESS v0/零 addons/TLS/TCP。
+- `full`：当前精确 1035 个 testcase，要求 1032 passed，只允许三个指定 Windows 测试以 pytest.skip 跳过；不是任意三个 skip。失败诊断仅发布源码白名单中的测试函数标识，不包含参数或异常文本。增减测试时须审阅并更新 `FULL_EXPECTED_CASES`。
+- 所有 gate 都要求固定二进制校验；不会接受环境变量提供的自定义摘要作为验收替代。
+- 即使协议 gate 通过，范围也仅为 `LOCAL_FIXTURE_ONLY`；不覆盖外部节点、Vision/WS/gRPC/Reality、Windows 或普通短请求的采样可靠性。
+
+最新远端执行状态见审计 044：完整 Linux 回归为 1032 passed、3 个指定 Windows skip；三套独立 gate 为 11/4/4 个通过且零 skip。当前沙箱本身仍缺少受支持 Python 和可用官方二进制；不要混淆本地与远端结果。
+
+## 4. 可选：显式启用 GitHub Actions 验收
+
+`.github/workflows/linux-local-acceptance.yml` 提供另一条运行路径，避免依赖当前沙箱的下载网络：
+
+- 提供 `workflow_dispatch`，以及标签启用的 `pull_request` 入口。PR 必须来自同仓库、目标为 main、带有 `run-local-acceptance` 标签；只响应 labeled/synchronize/reopened。没有 push/schedule 或 `pull_request_target`，也没有节点、凭据或下载 URL 输入。
+- 标签代表允许在该 PR 的后续提交上持续运行本机验收；移除标签后，后续事件不再运行此 job。移除标签不会取消已经启动的任务。Fork PR 即使带标签也不会运行此 job。
+- GitHub 托管 Ubuntu 24.04 runner，Python 3.12；官方 actions 固定到完整 commit SHA，仓库权限只读，checkout 不持久化 token。
+- 下载固定官方资源，调用同一个双摘要离线准备脚本，再分别执行 session、Trojan TCP、VLESS TCP 与 full gate。
+- 任一 gate 的非零退出码都会使 job 失败；使用 bash pipefail，不让 `tee` 隐藏失败。准备成功后，即使前一套 gate 失败，也继续运行其余独立 gate。
+- 仅上传 `preparation.json`、`session.json`、`trojan-tcp.json`、`vless-tcp.json`、`full.json`，保留 7 天；不上传原始 pytest/引擎日志、配置、证书、二进制、Junit XML 或运行目录。
+- 固定 20 分钟 job 上限。取消/超时不是通过或清理完成证据，不能替代进程回收验收；不自动取消同分支正在运行的任务。
+- 项目/pytest 依赖按当前项目约束安装，尚非全依赖锁定的可重复构建。网络下载、托管 runner 和 actions 自身也可能失败，workflow 配置存在不保证执行成功。
+
+草稿 PR 为 [#2](https://github.com/wpuu/NodeLab/pull/2)，会话分支为 `arena/01a0e60c-nodelab`。新增的 `workflow_dispatch` 工作流通常需要先出现在默认分支，GitHub 才会注册手动触发入口；指定 `--ref` 不会绕过这一条件。
+
+为避免仅为注册入口而合并未验收代码，可由维护者给同仓库 PR 添加 `run-local-acceptance` 标签，使用 PR merge revision 上的工作流直接运行，不必先修改 main。此入口会执行 PR 代码，因此只应对可信、已获准运行的同仓库分支启用；job 条件不是抵御能修改工作流代码的恶意仓库写入者的安全边界。它不使用特权的 `pull_request_target`。
+
+```sh
+gh pr edit 2 --add-label run-local-acceptance
+gh run list --branch arena/01a0e60c-nodelab
+```
+
+实际 run 的 commit 与 PR head/merge revision 都需要核对；标签、草稿状态和绿色的 skipped job 均不是验收证据。手动入口在默认分支注册后，也可使用：
+
+```sh
+gh workflow run linux-local-acceptance.yml --ref arena/01a0e60c-nodelab
+gh run list --workflow linux-local-acceptance.yml --branch arena/01a0e60c-nodelab
+# 使用实际返回的 run ID：
+# gh run view RUN_ID
+# gh run download RUN_ID --dir tools/acceptance-results
+```
+
+检查具体 run 的 commit、结论和所有三个 gate 的 JSON，不以 artifact 存在或 preparation 成功替代验收。即使全部通过，也仍仅限本机 fixture 范围，`real_node_test_allowed` 必须为 false。静态 YAML/测试检查不属于 GitHub runner 执行证据。
+
+### 历史远端运行：基础设施阻塞（已被后续成功运行取代）
+
+PR #2 的标签入口已经实际触发：[run 36399985871](https://github.com/wpuu/NodeLab/actions/runs/36399985871)，head `5f7f80871273592a8f92b934f42bf68ad94be587`。GitHub 因账户付款失败或支出额度限制阻止 job 启动；`steps=[]`、artifact 数量为 0。没有执行任何 gate，此 failure 不是测试失败，也不是验收通过。
+
+已暂时移除 `run-local-acceptance` 标签。账户维护者需先检查 GitHub 的 Billing & plans / Actions 支付与额度，之后再添加标签以验证最新 revision；不要通过修改 gate 或反复 rerun 绕过基础设施阻塞。详见审计 020。无需提供任何账单信息或凭据给本工具。
+
+### 最新远端运行：三套 gate 通过
+
+用户将仓库公开后，run 36402330033 和 [run 36402531966](https://github.com/wpuu/NodeLab/actions/runs/36402531966) 均成功。后者 head 为 `a10c1dbe661bca8f2408fedfbdf54540e09c97fa`，已通过 check annotations API 核对：session 11 passed、Trojan TCP 4 passed、VLESS TCP 4 passed，全部零 skip。双摘要官方 Mihomo 准备成功，真实协议 gate 范围仅 `LOCAL_FIXTURE_ONLY`，真实节点使用/授权仍为 false。
+
+当前沙箱无法下载 Actions blob 附件，因此工作流新增同一份固定字段 JSON 的 check notices；可通过 `gh api repos/wpuu/NodeLab/check-runs/108863525420/annotations` 读取。不会发布原始引擎日志或测试凭据。审计 021 记录证据和限制。
+
+本轮已移除 opt-in 标签，避免文档更新重复触发；后续代码验收仍可重新添加。无需为此次本机验收调整支出预算。公共仓库运行成功不等于账户账单状态全面正常，也不等于所有平台或生产探测通过。
+
+### 最新补充：受支持 Python 上的全量回归
+
+[run 36403873841](https://github.com/wpuu/NodeLab/actions/runs/36403873841)，head `1325490ce9ae1212b6b7bb8647a575d837af89c4`：`LINUX_FULL_REGRESSION / PASS / FULL_REGRESSION_OK`，**685 passed、3 skipped**。三个 skip 身份已由 gate 严格核对为 Windows 专属测试。session/Trojan/VLESS 也再次通过。结果通过 check `108868158025` 的 annotations API 读回核实。
+
+具体证据、统计边界和限制见审计 022。full 覆盖已有独立 gate 的用例，不把重复执行计为更多独立用例。opt-in 标签已在完成验收后移除；后续代码变更仍需重新验收。
+
+### Controller 严格解析后的复验
+
+审计 023 修复重复 JSON 键静默覆盖与非有限数值被接受的问题。新增 19 项后，全量预期总数为 707。
+
+[run 36405427124](https://github.com/wpuu/NodeLab/actions/runs/36405427124)，head `c5b6fce3c6fa478e30c39a806137ab958aa4aaf9`：完整回归 **704 passed、3 个指定 Windows skip**，三套独立 gate 分别 11/4/4 通过且零 skip。通过 check `108872893313` 的 annotations API 核实；本轮未增加外部探测或修改授权门禁。
+
+### 启动期逐请求所有权复核后的验收
+
+审计 024 为启动器每次 controller HTTP 增加前后存活/端口归属检查，避免持续复用初始 readiness 结果；不是原子 socket 身份证明。新增 18 项负控后，full 总数为 725。
+
+[run 36408708687](https://github.com/wpuu/NodeLab/actions/runs/36408708687)，head `d952a565a0b90d273d8d6ef1045bec65037081a8`：完整回归 **722 passed、3 个指定 Windows skip**，三套独立 gate 分别 11/4/4 通过且零 skip。check `108883489374` 的固定 annotations 已读回核对。共享 deadline、单所有者清理和生产门禁保持不变。
+
+### 清理异常边界加固后的验收
+
+审计 025 使停止子进程中的意外异常/取消不再跳过私有 YAML 删除尝试；清理未知统一固定失败，不误报 closed，不暴露先前异常文本。删除本身失败仍可能留下明文，这不是断电/强制终止恢复保证。
+
+[run 36410716164](https://github.com/wpuu/NodeLab/actions/runs/36410716164)，head `d044cccdeb5cd303a9fa42a4f8bf92b9faac6648`：完整回归 **734 passed、3 个指定 Windows skip**，三套独立 gate 分别 11/4/4 通过且零 skip；check `108889982043` 的固定 annotations 已核对。新增 12 项后 full 总数为 737，生产授权门禁不变。
+
+### 原生 Node.js 24 Actions 复验
+
+审计 026 将 checkout / setup-python / upload-artifact 更新为已按固定 SHA 核对 `runs.using=node24` 的官方版本，保留只读权限和显式启用策略。报告明确 ZIP 打包，排除隐藏文件；测试总数仍为 737。
+
+[run 36411287183](https://github.com/wpuu/NodeLab/actions/runs/36411287183)，head `1589b4a9123763ab440019a9ca20bfc9ca55e9af`：完整回归 **734 passed、3 个指定 Windows skip**，独立 gate 11/4/4 全过且零 skip。check `108891838127` 仅有五条结果 notice，无此前的 Node 20 弃用注释；报告上传步骤和 artifact 元数据均已核对。
+
+### Linux 恢复的 pidfd 要求
+
+审计 027 取消恢复路径的数字 PID 信号 fallback。Linux 自动恢复终止现在需要 `os.pidfd_open`、`signal.pidfd_send_signal`、可用内核权限和完整匹配身份；不可核实时返回失败，不把读取 /proc 失败当成进程消失。旧内核/API 或权限受限环境不再尝试较弱的终止方式。正常持有 Popen 的清理路径不受此能力要求影响。
+
+[run 36413400189](https://github.com/wpuu/NodeLab/actions/runs/36413400189)，head `0ce612017f20141a010a33054d91d949ac494e0e`：完整回归 **765 passed、3 个指定 Windows skip**，三套独立 gate 11/4/4 全过且零 skip；check `108898701420` 的固定 annotations 已核对。新增 31 项后 full 总数为 768，生产门禁仍关闭。
+
+### Linux 恢复记录的启动实例绑定
+
+审计 028 增加 `linux_boot_fingerprint`。Linux 新运行必须能读取规范 `/proc/sys/kernel/random/boot_id`；只保存用途区分的摘要。恢复时旧记录缺字段、格式错误、与当前启动不同或当前标识不可读，都返回 `RECOVERY_REVIEW_REQUIRED`，不查询/终止记录中的进程，也不删除目录/YAML。不会自动把旧记录补写为当前启动：旧残留需要人工审阅，不能为解除阻塞而伪造绑定。
+
+[run 36414504335](https://github.com/wpuu/NodeLab/actions/runs/36414504335)，head `9884f59b40d464b7b6c12cf2db258df267cb126f`：完整回归 **784 passed、3 个指定 Windows skip**，独立 gate 11/4/4 全过且零 skip；check `108902279375` 的固定 annotations 已核对。新增 19 项后 full 总数为 787。本轮用注入标识模拟跨启动，不代表实际主机重启或 Windows 验收。
+
+### Linux marker 原子发布
+
+审计 029 将 Linux `.owner.json` 更新改为同目录 0600 临时文件 → 文件 fsync → 原子替换 → 目录 fsync，避免发布前失败截断旧记录。若崩溃留下 `.owner-*.tmp`，既有恢复白名单会要求人工复核，保留现场；不要自动删掉临时文件来绕过阻塞。发布后同步失败会报错，不假装回滚或宣称断电持久性已验收。
+
+[run 36417115761](https://github.com/wpuu/NodeLab/actions/runs/36417115761)，head `98b8d6c9bfab1c041f3cc2e20b56111dc55fa657`：完整回归 **795 passed、3 个指定 Windows skip**，独立 gate 11/4/4 全过且零 skip；check `108910796275` 的固定 annotations 已核对。新增 11 项后 full 总数为 798，Windows 发布路径和生产门禁未改变。
+
+### Linux 停止失败时保留恢复依据
+
+审计 030 改变 Linux 失败清理：仍尝试删除 YAML 和非恢复负载，但保留 `.owner.json`/`.owner-*.tmp` 与私有目录。owned close 仍失败并保持锁/进程所有权；stale recovery 停止未确认时仍失败并保留 stale lock，不销毁最后的身份记录。后续确认停止才完整删除。临时 marker 依然阻塞自动恢复；owner 退出后的 stale 残留可能阻塞新运行，不要盲删记录绕过。
+
+[run 36419262286](https://github.com/wpuu/NodeLab/actions/runs/36419262286)，head `be17ca75378cca7e43684702f43ff0df444f9fdd`：完整回归 **809 passed、3 个指定 Windows skip**，独立 gate 11/4/4 全过且零 skip，check `108917763864` 的固定 annotations 已核对。新增 14 项包括真实 owner 退出、child 存活、恢复重试和稳定 pidfd 退出证据；full 总数为 812。
+
+本轮仅保护已成功记录的 child 身份；创建到首次 marker 发布的窗口仍未解决，文件系统错误也可能阻止 YAML 删除。Windows 保留策略未迁移/验收，未进行主机重启或断电测试，生产门禁继续关闭。
+
+### Linux marker 描述符核验与有界读取
+
+审计 031 将 Linux 恢复读取收紧为打开后核验同一 fd 的类型/UID/0600/单硬链接/大小，再限量读取 4097 字节、拒绝超过 4096 字节的记录。最终路径软链接、FIFO、硬链接、读取异常或过深 JSON 都不能成为有效 marker。父目录替换、原地恶意改写及恢复 owner 身份不可读时的判断仍不是本轮解决范围。
+
+[run 36437457557](https://github.com/wpuu/NodeLab/actions/runs/36437457557)，head `373e0c8cb7c9a4bde47ec5620e1a6bdeb779a367`：完整回归 **825 passed、3 个指定 Windows skip**，独立 gate 11/4/4 全过且零 skip；check `108978955993` 固定 annotations 已核对。新增 16 项，full 总数为 828；旧的硬链接 marker 需人工复核，生产门禁继续关闭。
+
+### Linux 恢复前确认原 owner 已退出
+
+审计 032 要求恢复先取得肯定的 owner 退出证据：内核 ESRCH、绑定 pidfd ready，或有效的同 PID/不同创建时间。身份不可读、缺创建时间或同创建时间下 executable 改变都不能单独授权继续；否则保留 YAML/marker 并返回 RECOVERY_REVIEW_REQUIRED，不执行 child 停止。该检查不向 owner 发信号；不支持 pidfd 的系统可能需要人工复核。此项收紧了审计 031 明确保留的 owner 未知状态判断缺口，不改变 Windows 分支。
+
+[run 36438792012](https://github.com/wpuu/NodeLab/actions/runs/36438792012)，head `c1ca762a42af4ec48b21bf04d68d66133652c999`：完整回归 **847 passed、3 个指定 Windows skip**，独立 gate 11/4/4 全过且零 skip，check `108983540257` 固定 annotations 已核对。新增 22 项，full 总数为 850；记录真实性、首次 child 记录窗口和生产门禁仍不由此解决。
+
+### Linux 缺失或不完整恢复记录
+
+审计 033 要求 Linux run 目录必须有 marker，child 三个键齐全且全部显式 null 或构成完整合法身份。缺 marker（包括空目录）、缺字段、部分 null、非法整数或指纹均在 owner/child 查询前返回 RECOVERY_REVIEW_REQUIRED，保留现场，可能阻塞新运行；不要自行补字段或盲删目录。当前 owner 的内存内清理路径不变。
+
+[run 36440387947](https://github.com/wpuu/NodeLab/actions/runs/36440387947)，head `e70093bdd593e47125c2d6465feca4c367f04e74`：完整回归 **873 passed、3 个指定 Windows skip**，独立 gate 11/4/4 全过且零 skip，check `108989022640` 固定 annotations 已核对。新增 26 项，full 总数为 876。全 null 是记录形状而非创建期无孤儿的证明；首次/更新 child marker 的窗口仍在，Windows 和生产门禁未开放。
+
+### Linux 创建前启动意图
+
+审计 034 在 Popen 前排他创建并同步 `.owner-launch.tmp`（0600、无凭据），成功发布 child 身份后才移除并同步目录。残留意图不加入恢复白名单，会保留现场并要求复核；未知构造器结果不再把 raw_child=None 当作没有进程。当前 owner 仍尝试删除 YAML，但可能保留 marker/意图/锁并返回 SECRET_CLEANUP_FAILED。不可盲删意图或重试同一未知上下文。
+
+[run 36442505342](https://github.com/wpuu/NodeLab/actions/runs/36442505342)，head `bcdad0b9d14dc592e411c2a4099192f54ecfc007`：完整回归 **888 passed、3 个指定 Windows skip**，独立 gate 11/4/4 全过且零 skip，check `108996326066` 固定 annotations 已核对。新增 15 项含真实 owner 在 child 创建后、Popen 返回前直接退出；full 总数为 891。
+
+该创建窗口现在可留下明确的“必须复核”记录，不等于已能自动找回未知 PID。若 owner 未执行 close 就退出，YAML 也可能留在私有目录；旧版本未写意图的事故不能补回证据。Windows 持久化协议、断电/重启与生产授权仍未验收。
+
+### Linux child exec 不再误报退出
+
+审计 035 修正记录恢复对 executable 变化的解释：同 PID/创建时间但路径指纹变化可能只是 exec，不能当作 child 已退出；不向这种已观察到身份变化的进程发信号，仅用绑定 pidfd 再确认退出。查询结果 PID 不一致也不证明复用。child 仍活时恢复报 PROCESS_STOP_FAILED、尝试删 YAML、保留 marker；不改绑到新 executable。
+
+[run 36445073974](https://github.com/wpuu/NodeLab/actions/runs/36445073974)，head `7a53b1e9539449bd5ece88f468a6ed273bd05930`：完整回归 **897 passed、3 个指定 Windows skip**，独立 gate 11/4/4 全过且零 skip，check `109005145141` 固定 annotations 已核对。新增 9 项含真实 Python→shell exec，full 总数为 900。
+
+这不冻结进程映像，也不消除查询之后/信号之间的 exec 竞态；路径指纹不是内容摘要。Windows、未知 PID 自动恢复及生产授权仍未验收。
+
+### Linux 每次恢复信号前重新核对身份
+
+审计 036 在 TERM/KILL 各次信号前复核完整身份，并在读取后再次检查共享 deadline。已观察到 exec/身份不可读/不一致时不再发送该阶段信号，仅以同一 pidfd ready 确认退出；不再沿用首次身份查询的授权。无数字 PID fallback，未冻结 executable，也不构成查询与信号的原子事务。
+
+[run 36449845409](https://github.com/wpuu/NodeLab/actions/runs/36449845409)，head `fe236ceb87ec1d5bc55b84c79b8c753b4623f6ec`：完整回归 **913 passed、3 个指定 Windows skip**，独立 gate 11/4/4 全过且零 skip，check `109021471280` 固定 annotations 已核对。新增 16 项，含真实 child 收到 TERM 后 exec、阻止 KILL 升级，full 总数为 916。未知 PID 自动找回、Windows、硬截止和生产授权仍未验收。
+
+### Linux 只读残留检查
+
+审计 037 提供 `nodelab recover --inspect`（与 --confirm 互斥）：有界扫描、分类残留，不读 YAML、不查询进程身份、不探测/获取锁，不发送信号或删除文件。独立白名单 JSON 不输出路径、PID 或凭据，COMPLETE 仅表示检查完成，不是恢复授权。锁只报告存在但未核验。详见 [只读检查说明](Linux-recovery-inspection.md)。
+
+[run 36451360873](https://github.com/wpuu/NodeLab/actions/runs/36451360873)，head `ed86eee6f6398c09841f2ac78c6a5a4d8f3ee9f2`：完整回归 **935 passed、3 个指定 Windows skip**，独立 gate 11/4/4 全过且零 skip，check `109026653084` 固定 annotations 已核对。新增 22 项，full 总数为 938。检查不解除阻塞，不补全未知 PID，不开放 Windows 或生产门禁。
+
+### Linux 锁文件核验与未知状态拒绝
+
+审计 038 对锁路径及实际打开对象核对普通文件/当前 UID/0600/单硬链接/零长度，只有明确的 flock 竞争按 live 处理，其他错误为 unsafe；恢复处理目录前再次拒绝 unsafe 或新近 live 的锁。inspection 共用外观规则，但依然不探测锁。异常旧锁可能需要人工复核，不自动修正。
+
+[run 36454765941](https://github.com/wpuu/NodeLab/actions/runs/36454765941)，head `d5b9a28e4f418e8779d7295a6a581aaceca3f8e4`：完整回归 **954 passed、3 个指定 Windows skip**，独立 gate 11/4/4 全过且零 skip，check `109038168013` 固定 annotations 已核对。新增 19 项，full 总数为 957。检查/使用仍非原子，stale 恢复锁并发接管与 unlink/recreate 竞态未因此解决。
