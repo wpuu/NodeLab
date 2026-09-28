@@ -257,6 +257,15 @@ def terminate_verified_process(expected: ProcessIdentity, *, budget: float = STO
             left = deadline - time.monotonic()
             if left <= 0:
                 return exited()
+            if exited():
+                return True
+            current = _linux_identity(expected.pid)
+            if not _recovery_identity(current) or current != expected:
+                # Reuse, exec or an unreadable view after binding is not a
+                # fresh authorization to signal or proof the bound task died.
+                return exited()
+            if deadline - time.monotonic() <= 0:
+                return exited()  # identity lookup consumes the same budget
             try:
                 signal.pidfd_send_signal(pidfd, sig)
             except ProcessLookupError:

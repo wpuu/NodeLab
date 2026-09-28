@@ -187,7 +187,8 @@ def test_identity_unreadable_after_signal_does_not_claim_death(rig):
     expected, _, _, _, identity, sent, numeric = rig
     sent.side_effect = lambda *args: setattr(identity, "return_value", None)
     assert lifecycle.terminate_verified_process(expected, budget=0.25) is False
-    identity.assert_called_once_with(expected.pid)
+    assert identity.call_count == 2  # initial binding and pre-TERM recheck
+    assert all(call.args == (expected.pid,) for call in identity.call_args_list)
     numeric.assert_not_called()
 
 
