@@ -22,6 +22,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from contextlib import contextmanager, nullcontext
 from pathlib import Path
 from typing import Any
 from uuid import UUID
@@ -352,7 +353,7 @@ def _linux_recovery_lock_matches(path: Path, fd: int) -> bool:
             and (held.st_dev, held.st_ino) == (named.st_dev, named.st_ino))
 
 
-def _acquire_linux_recovery_lock(path: Path, *, create: bool = True) -> int:
+def _acquire_linux_recovery_lock(path: Path, *, create: bool = True, exclusive: bool = False) -> int:
     """Take an existing stale inode directly; never unlink before acquiring.
 
     An opener that raced the previous holder's unlink may own an unlinked old
@@ -363,6 +364,8 @@ def _acquire_linux_recovery_lock(path: Path, *, create: bool = True) -> int:
     flags = os.O_RDWR | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK
     if create:
         flags |= os.O_CREAT
+    if exclusive:
+        flags |= os.O_EXCL
     fd = os.open(path, flags, 0o600)
     try:
         if not _linux_lock_metadata(os.fstat(fd)):
@@ -499,6 +502,25 @@ def _classify_root_entries(root: Path) -> tuple[int, list[Path]]:
         if state != "missing":
             review.append(lock)
     return live, review
+
+
+@contextmanager
+def _linux_startup_admission(root: Path):
+    """Serialize startup publication with recovery; never take over residue."""
+    lock = root / _RECOVER_LOCK
+    try:
+        fd = _acquire_linux_recovery_lock(lock, exclusive=True)
+    except (OSError, ValueError, PrivateRunError):
+        raise PrivateRunError("RECOVERY_REVIEW_REQUIRED") from None
+    try:
+        # The first scan preceded admission and may already be obsolete.
+        # Only our own root lock is excluded; live run locks remain allowed.
+        _live, review = _classify_root_entries(root)
+        if any(entry.name != _RECOVER_LOCK for entry in review):
+            raise PrivateRunError("RECOVERY_REVIEW_REQUIRED")
+        yield
+    finally:
+        _release_linux_recovery_lock(lock, fd)
 
 
 class RunContext:
@@ -654,26 +676,33 @@ class RunContext:
             raise PrivateRunError()
         try:
             self._ensure_root()
-            self.run_id = secrets.token_hex(16)
-            # Lock first, then mkdir: a concurrent scanner therefore never
-            # sees a run directory whose lock is not yet held.
-            self._lock_path = self.root / (self.run_id + _LOCK_SUFFIX)
-            self._lock_fd = _acquire_lock(self._lock_path)
-            self.run_dir = self.root / self.run_id
-            self.run_dir.mkdir(mode=0o700)
-            if os.name == "nt":
-                _restrict_new_windows(self.run_dir, self._windows_owner_sid, directory=True)
-            else:
-                self._verify(self.run_dir, directory=True)
-            self.active = True
-            self._write_marker()
-            return self
+            admission = (_linux_startup_admission(self.root)
+                         if sys.platform == "linux" else nullcontext())
+            with admission:
+                self.run_id = secrets.token_hex(16)
+                # Lock first, then mkdir: a concurrent scanner therefore never
+                # sees a run directory whose lock is not yet held.
+                self._lock_path = self.root / (self.run_id + _LOCK_SUFFIX)
+                self._lock_fd = _acquire_lock(self._lock_path)
+                self.run_dir = self.root / self.run_id
+                self.run_dir.mkdir(mode=0o700)
+                if os.name == "nt":
+                    _restrict_new_windows(self.run_dir, self._windows_owner_sid, directory=True)
+                else:
+                    self._verify(self.run_dir, directory=True)
+                self.active = True
+                self._write_marker()
+                return self
         except PrivateRunError:
             self._cleanup_empty_failed_enter()
             raise
         except (OSError, ValueError, subprocess.SubprocessError):
             self._cleanup_empty_failed_enter()
             raise PrivateRunError() from None
+        except BaseException:
+            if sys.platform == "linux":
+                self._cleanup_empty_failed_enter()
+            raise
 
     def _cleanup_empty_failed_enter(self) -> None:
         if self.run_dir is not None:
