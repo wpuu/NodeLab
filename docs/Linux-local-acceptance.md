@@ -61,11 +61,12 @@ tools/runtime/acceptance/bin/python scripts/f2_session_gate.py \
 
 当前执行状态见审计 018：尚无可用官方二进制或受支持 Python；三套 gate 均被 Python 版本前置条件阻塞，真实互操作未执行。
 
-## 4. 可选：手动 GitHub Actions 验收
+## 4. 可选：显式启用 GitHub Actions 验收
 
 `.github/workflows/linux-local-acceptance.yml` 提供另一条运行路径，避免依赖当前沙箱的下载网络：
 
-- 仅 `workflow_dispatch`，没有 push/PR/schedule 触发，也没有节点、凭据或下载 URL 输入。
+- 提供 `workflow_dispatch`，以及标签启用的 `pull_request` 入口。PR 必须来自同仓库、目标为 main、带有 `run-local-acceptance` 标签；只响应 labeled/synchronize/reopened。没有 push/schedule 或 `pull_request_target`，也没有节点、凭据或下载 URL 输入。
+- 标签代表允许在该 PR 的后续提交上持续运行本机验收；移除标签后，后续事件不再运行此 job。移除标签不会取消已经启动的任务。Fork PR 即使带标签也不会运行此 job。
 - GitHub 托管 Ubuntu 24.04 runner，Python 3.12；官方 actions 固定到完整 commit SHA，仓库权限只读，checkout 不持久化 token。
 - 下载固定官方资源，调用同一个双摘要离线准备脚本，再分别执行 session、Trojan TCP、VLESS TCP gate。
 - 任一 gate 的非零退出码都会使 job 失败；使用 bash pipefail，不让 `tee` 隐藏失败。准备成功后，即使前一套 gate 失败，也继续运行其余独立 gate。
@@ -73,7 +74,16 @@ tools/runtime/acceptance/bin/python scripts/f2_session_gate.py \
 - 固定 20 分钟 job 上限。取消/超时不是通过或清理完成证据，不能替代进程回收验收；不自动取消同分支正在运行的任务。
 - 项目/pytest 依赖按当前项目约束安装，尚非全依赖锁定的可重复构建。网络下载、托管 runner 和 actions 自身也可能失败，workflow 配置存在不保证执行成功。
 
-**本轮没有推送或触发远端工作流。** 新增的 `workflow_dispatch` 工作流通常需要先出现在仓库默认分支，GitHub 才会注册手动触发入口；指定 `--ref` 不会绕过这一条件。待工作流注册、目标分支已推送且获准执行后，可使用：
+草稿 PR 为 [#2](https://github.com/wpuu/NodeLab/pull/2)，会话分支为 `arena/01a0e60c-nodelab`。新增的 `workflow_dispatch` 工作流通常需要先出现在默认分支，GitHub 才会注册手动触发入口；指定 `--ref` 不会绕过这一条件。
+
+为避免仅为注册入口而合并未验收代码，可由维护者给同仓库 PR 添加 `run-local-acceptance` 标签，使用 PR merge revision 上的工作流直接运行，不必先修改 main。此入口会执行 PR 代码，因此只应对可信、已获准运行的同仓库分支启用；job 条件不是抵御能修改工作流代码的恶意仓库写入者的安全边界。它不使用特权的 `pull_request_target`。
+
+```sh
+gh pr edit 2 --add-label run-local-acceptance
+gh run list --branch arena/01a0e60c-nodelab
+```
+
+实际 run 的 commit 与 PR head/merge revision 都需要核对；标签、草稿状态和绿色的 skipped job 均不是验收证据。手动入口在默认分支注册后，也可使用：
 
 ```sh
 gh workflow run linux-local-acceptance.yml --ref arena/01a0e60c-nodelab

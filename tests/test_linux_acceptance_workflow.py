@@ -11,8 +11,16 @@ JOB = WORKFLOW["jobs"]["local-acceptance"]
 STEPS = JOB["steps"]
 
 
-def test_workflow_is_manual_without_inputs_or_write_permissions():
-    assert WORKFLOW["on"] == {"workflow_dispatch": None}
+def test_workflow_is_explicit_opt_in_without_inputs_or_write_permissions():
+    assert WORKFLOW["on"] == {
+        "workflow_dispatch": None,
+        "pull_request": {"branches": ["main"], "types": ["labeled", "synchronize", "reopened"]},
+    }
+    assert JOB["if"] == (
+        "github.event_name == 'workflow_dispatch' || "
+        "(github.event.pull_request.head.repo.full_name == github.repository &&\n"
+        " contains(github.event.pull_request.labels.*.name, 'run-local-acceptance'))"
+    )
     assert WORKFLOW["permissions"] == {"contents": "read"}
     assert WORKFLOW["concurrency"]["cancel-in-progress"] is False
     assert JOB["runs-on"] == "ubuntu-24.04"

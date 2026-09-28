@@ -1,8 +1,12 @@
 name: Linux local engine acceptance
 
-# Deliberately manual: no PR, push, schedule, external node, or credential input.
+# Explicit opt-in only: manual dispatch or a labeled same-repository PR.
+# Never pull_request_target; no external node or credential input.
 "on":
   workflow_dispatch:
+  pull_request:
+    branches: [main]
+    types: [labeled, synchronize, reopened]
 
 permissions:
   contents: read
@@ -17,6 +21,10 @@ defaults:
 
 jobs:
   local-acceptance:
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.pull_request.head.repo.full_name == github.repository &&
+       contains(github.event.pull_request.labels.*.name, 'run-local-acceptance'))
     runs-on: ubuntu-24.04
     # A runner timeout/cancellation is NOT cleanup or acceptance evidence.
     timeout-minutes: 20
