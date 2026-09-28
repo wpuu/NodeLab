@@ -147,13 +147,33 @@ def process_identity(pid: int) -> ProcessIdentity | None:
     return None  # no reliable creation stamp here: callers must not kill
 
 
+def _recovery_identity(value: ProcessIdentity | None) -> bool:
+    return (type(value) is ProcessIdentity
+            and type(value.pid) is int and value.pid > 0
+            and type(value.create_time) is int and value.create_time > 0
+            and (value.exe_fingerprint is None or
+                 (type(value.exe_fingerprint) is str and len(value.exe_fingerprint) == 32
+                  and all(c in "0123456789abcdef" for c in value.exe_fingerprint))))
+
+
 def terminate_verified_process(expected: ProcessIdentity, *, budget: float = STOP_BUDGET_SECONDS) -> bool:
     """Terminate a pid only while it still is exactly `expected`; True when gone.
 
     An identity mismatch means the recorded child already exited (and the pid
-    may belong to someone else), so nothing is signalled.
+    may belong to someone else), so nothing is signalled. Linux recovery
+    requires pidfd APIs and a complete matching fingerprint before signalling;
+    an unreadable identity is not itself proof of exit.
     """
-    deadline = time.monotonic() + budget
+    if not _recovery_identity(expected) or type(budget) not in (int, float):
+        return False
+    try:
+        if not math.isfinite(budget) or budget <= 0:
+            return False
+        deadline = time.monotonic() + budget
+        if not math.isfinite(deadline):
+            return False
+    except OverflowError:
+        return False
     if os.name == "nt":
         proc = _WindowsProcess(expected.pid, terminate=True)
         try:
@@ -164,52 +184,49 @@ def terminate_verified_process(expected: ProcessIdentity, *, budget: float = STO
             proc.close()
     if not os.path.isdir("/proc"):
         return False  # cannot verify identity on this platform: leave it alone
-    pidfd = None
+    # A recovery record is not a Popen owner. Never fall back to os.kill(pid):
+    # the PID can be reused after the identity query. Older kernels/Pythons or
+    # denied pidfd access require review rather than weaker termination.
+    if not hasattr(os, "pidfd_open") or not hasattr(signal, "pidfd_send_signal"):
+        return False
     try:
-        if hasattr(os, "pidfd_open"):
+        pidfd = os.pidfd_open(expected.pid)
+    except ProcessLookupError:
+        return True  # kernel-confirmed absence, not an unreadable /proc record
+    except (OSError, OverflowError, ValueError):
+        return False
+    try:
+        def exited(timeout: float = 0.0) -> bool:
+            ready, _, _ = select.select([pidfd], [], [], max(0.0, timeout))
+            return bool(ready)
+
+        if exited():
+            return True
+        current = _linux_identity(expected.pid)
+        if not _recovery_identity(current):
+            return exited()  # None also means permission/read errors, NOT gone
+        if not expected.matches(current):
+            return True  # known different identity: leave it untouched
+        if expected.exe_fingerprint is None or current.exe_fingerprint is None:
+            return False
+
+        # After binding, only descriptor readiness or ESRCH confirms exit;
+        # a later unreadable /proc record must not turn into successful cleanup.
+        for sig, cap in ((signal.SIGTERM, 3.0), (signal.SIGKILL, budget)):
+            left = deadline - time.monotonic()
+            if left <= 0:
+                return exited()
             try:
-                pidfd = os.pidfd_open(expected.pid)
-            except OSError:
-                pidfd = None
-        if not expected.matches(_linux_identity(expected.pid)):
-            return True
-
-        def send(sig: int) -> None:
-            if pidfd is not None and hasattr(signal, "pidfd_send_signal"):
-                signal.pidfd_send_signal(pidfd, sig)  # bound to this process, not the pid number
-            else:
-                os.kill(expected.pid, sig)
-
-        def gone(timeout: float) -> bool:
-            end = time.monotonic() + timeout
-            while True:
-                if pidfd is not None:
-                    ready, _, _ = select.select([pidfd], [], [], max(0.0, min(0.2, end - time.monotonic())))
-                    if ready:
-                        return True
-                if not expected.matches(_linux_identity(expected.pid)):
-                    return True
-                if time.monotonic() >= end:
-                    return False
-                if pidfd is None:
-                    time.sleep(0.05)
-
-        try:
-            send(signal.SIGTERM)
-        except ProcessLookupError:
-            return True
-        if gone(min(3.0, max(0.1, deadline - time.monotonic()))):
-            return True
-        try:
-            send(signal.SIGKILL)
-        except ProcessLookupError:
-            return True
-        return gone(max(0.1, deadline - time.monotonic()))
-    except OSError:
-        return not expected.matches(_linux_identity(expected.pid))
+                signal.pidfd_send_signal(pidfd, sig)
+            except ProcessLookupError:
+                return True
+            if exited(min(cap, max(0.0, deadline - time.monotonic()))):
+                return True
+        return False
+    except (OSError, ValueError):
+        return False
     finally:
-        if pidfd is not None:
-            os.close(pidfd)
+        os.close(pidfd)
 
 
 def find_mihomo_exe() -> Path | None:
