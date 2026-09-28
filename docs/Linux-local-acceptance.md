@@ -58,11 +58,11 @@ tools/runtime/acceptance/bin/python scripts/f2_session_gate.py \
 - `session`：精确 11 个用例通过且零 skip；合成会话范围，不是实际代理协议证明。
 - `trojan-tcp`：精确 4 个用例通过且零 skip；实际本机 Trojan/TLS/TCP。
 - `vless-tcp`：精确 4 个用例通过且零 skip；实际本机 VLESS v0/零 addons/TLS/TCP。
-- `full`：当前精确 876 个 testcase，要求 873 passed，只允许三个指定 Windows 测试以 pytest.skip 跳过；不是任意三个 skip。失败诊断仅发布源码白名单中的测试函数标识，不包含参数或异常文本。增减测试时须审阅并更新 `FULL_EXPECTED_CASES`。
+- `full`：当前精确 891 个 testcase，要求 888 passed，只允许三个指定 Windows 测试以 pytest.skip 跳过；不是任意三个 skip。失败诊断仅发布源码白名单中的测试函数标识，不包含参数或异常文本。增减测试时须审阅并更新 `FULL_EXPECTED_CASES`。
 - 所有 gate 都要求固定二进制校验；不会接受环境变量提供的自定义摘要作为验收替代。
 - 即使协议 gate 通过，范围也仅为 `LOCAL_FIXTURE_ONLY`；不覆盖外部节点、Vision/WS/gRPC/Reality、Windows 或普通短请求的采样可靠性。
 
-最新远端执行状态见审计 033：完整 Linux 回归为 873 passed、3 个指定 Windows skip；三套独立 gate 为 11/4/4 个通过且零 skip。当前沙箱本身仍缺少受支持 Python 和可用官方二进制；不要混淆本地与远端结果。
+最新远端执行状态见审计 034：完整 Linux 回归为 888 passed、3 个指定 Windows skip；三套独立 gate 为 11/4/4 个通过且零 skip。当前沙箱本身仍缺少受支持 Python 和可用官方二进制；不要混淆本地与远端结果。
 
 ## 4. 可选：显式启用 GitHub Actions 验收
 
@@ -185,3 +185,11 @@ PR #2 的标签入口已经实际触发：[run 36399985871](https://github.com/w
 审计 033 要求 Linux run 目录必须有 marker，child 三个键齐全且全部显式 null 或构成完整合法身份。缺 marker（包括空目录）、缺字段、部分 null、非法整数或指纹均在 owner/child 查询前返回 RECOVERY_REVIEW_REQUIRED，保留现场，可能阻塞新运行；不要自行补字段或盲删目录。当前 owner 的内存内清理路径不变。
 
 [run 36440387947](https://github.com/wpuu/NodeLab/actions/runs/36440387947)，head `e70093bdd593e47125c2d6465feca4c367f04e74`：完整回归 **873 passed、3 个指定 Windows skip**，独立 gate 11/4/4 全过且零 skip，check `108989022640` 固定 annotations 已核对。新增 26 项，full 总数为 876。全 null 是记录形状而非创建期无孤儿的证明；首次/更新 child marker 的窗口仍在，Windows 和生产门禁未开放。
+
+### Linux 创建前启动意图
+
+审计 034 在 Popen 前排他创建并同步 `.owner-launch.tmp`（0600、无凭据），成功发布 child 身份后才移除并同步目录。残留意图不加入恢复白名单，会保留现场并要求复核；未知构造器结果不再把 raw_child=None 当作没有进程。当前 owner 仍尝试删除 YAML，但可能保留 marker/意图/锁并返回 SECRET_CLEANUP_FAILED。不可盲删意图或重试同一未知上下文。
+
+[run 36442505342](https://github.com/wpuu/NodeLab/actions/runs/36442505342)，head `bcdad0b9d14dc592e411c2a4099192f54ecfc007`：完整回归 **888 passed、3 个指定 Windows skip**，独立 gate 11/4/4 全过且零 skip，check `108996326066` 固定 annotations 已核对。新增 15 项含真实 owner 在 child 创建后、Popen 返回前直接退出；full 总数为 891。
+
+该创建窗口现在可留下明确的“必须复核”记录，不等于已能自动找回未知 PID。若 owner 未执行 close 就退出，YAML 也可能留在私有目录；旧版本未写意图的事故不能补回证据。Windows 持久化协议、断电/重启与生产授权仍未验收。
