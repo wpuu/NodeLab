@@ -29,11 +29,18 @@ def test_workflow_is_explicit_opt_in_without_inputs_or_write_permissions():
 
 def test_actions_are_commit_pinned_and_checkout_does_not_persist_token():
     actions = [step for step in STEPS if "uses" in step]
+    assert {step["uses"] for step in actions} == {
+        "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
+        "actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97",
+        "actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a",
+    }
     assert len(actions) == 3
+    assert "ACTIONS_ALLOW_USE_UNSECURE_NODE_VERSION" not in PATH.read_text()
     for step in actions:
         assert re.fullmatch(r"actions/(checkout|setup-python|upload-artifact)@[0-9a-f]{40}", step["uses"])
     checkout = next(step for step in actions if step["uses"].startswith("actions/checkout@"))
     assert checkout["with"]["persist-credentials"] is False
+    assert not checkout["with"].get("allow-unsafe-pr-checkout", False)
     python = next(step for step in actions if step["uses"].startswith("actions/setup-python@"))
     assert python["with"]["python-version"] == "3.12"
 
@@ -73,7 +80,8 @@ def test_artifact_upload_is_explicit_allowlist_not_logs_or_runtime():
     }
     assert upload["with"]["retention-days"] == 7
     assert "!cancelled()" in upload["if"]
-    assert not upload["with"].get("include-hidden-files", False)
+    assert upload["with"]["include-hidden-files"] is False
+    assert upload["with"]["archive"] is True
 
 
 def test_annotations_only_publish_known_fixed_field_reports():
