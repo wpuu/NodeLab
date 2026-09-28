@@ -10,7 +10,8 @@ from typing import Any
 
 from nodelab.mihomo_config import PrivateRunError, recover_stale_runs
 from nodelab.parser import parse_uris
-from nodelab.redaction import redacted_result_dict
+from nodelab.redaction import redacted_result_dict, redacted_recovery_inspection
+from nodelab.recovery_inspection import inspect_private_runs
 from nodelab.types import PROBE_GATE_OPEN
 
 _MAX_INPUT_BYTES = 512 * 1024
@@ -78,17 +79,22 @@ def _cmd_parse_stdin(args: argparse.Namespace) -> int:
 
 def _cmd_recover(args: argparse.Namespace) -> int:
     """Explicit crash recovery of the private root; never a global process sweep."""
-    if not args.confirm:
+    if not args.confirm and not args.inspect:
         return _failure("INVALID_ARGUMENTS", "CLEANUP")
     try:
         root = Path(args.root) if args.root else None
         if root is not None and not root.is_absolute():
             return _failure("INVALID_ARGUMENTS", "CLEANUP")
+        if args.inspect:
+            report = redacted_recovery_inspection(inspect_private_runs(root))
+            print(json.dumps(report, ensure_ascii=False, separators=(",", ":")))
+            return 0 if report["inspection_status"] == "COMPLETE" else 2
         rows = recover_stale_runs(root)
     except PrivateRunError as exc:
         return _failure(exc.code, "CLEANUP")
     except (OSError, ValueError):
-        return _failure("SECRET_CLEANUP_FAILED", "CLEANUP")
+        code = "RECOVERY_INSPECTION_FAILED" if args.inspect else "SECRET_CLEANUP_FAILED"
+        return _failure(code, "CLEANUP")
     _emit(rows)
     return 0 if all(row.get("error_code") is None for row in rows) else 2
 
@@ -112,7 +118,9 @@ def main(argv: list[str] | None = None) -> int:
     p_probe.add_argument("--limit", type=int, default=1)
     sub.add_parser("probe-stdin", help="Reserved until route-proof and Windows gates")
     p_rec = sub.add_parser("recover", help="Verified cleanup of crashed private runs (no process-name sweep)")
-    p_rec.add_argument("--confirm", action="store_true", help="Required: may stop an identity-verified orphaned child")
+    recovery_mode = p_rec.add_mutually_exclusive_group()
+    recovery_mode.add_argument("--confirm", action="store_true", help="May stop an identity-verified orphaned child")
+    recovery_mode.add_argument("--inspect", action="store_true", help="Linux read-only inspection; does not authorize cleanup")
     p_rec.add_argument("--root", default=None, help="Private root (Windows: fixed; POSIX: per-user default)")
     try:
         args = parser.parse_args(argv)
