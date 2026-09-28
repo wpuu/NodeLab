@@ -58,11 +58,11 @@ tools/runtime/acceptance/bin/python scripts/f2_session_gate.py \
 - `session`：精确 11 个用例通过且零 skip；合成会话范围，不是实际代理协议证明。
 - `trojan-tcp`：精确 4 个用例通过且零 skip；实际本机 Trojan/TLS/TCP。
 - `vless-tcp`：精确 4 个用例通过且零 skip；实际本机 VLESS v0/零 addons/TLS/TCP。
-- `full`：当前精确 798 个 testcase，要求 795 passed，只允许三个指定 Windows 测试以 pytest.skip 跳过；不是任意三个 skip。失败诊断仅发布源码白名单中的测试函数标识，不包含参数或异常文本。增减测试时须审阅并更新 `FULL_EXPECTED_CASES`。
+- `full`：当前精确 812 个 testcase，要求 809 passed，只允许三个指定 Windows 测试以 pytest.skip 跳过；不是任意三个 skip。失败诊断仅发布源码白名单中的测试函数标识，不包含参数或异常文本。增减测试时须审阅并更新 `FULL_EXPECTED_CASES`。
 - 所有 gate 都要求固定二进制校验；不会接受环境变量提供的自定义摘要作为验收替代。
 - 即使协议 gate 通过，范围也仅为 `LOCAL_FIXTURE_ONLY`；不覆盖外部节点、Vision/WS/gRPC/Reality、Windows 或普通短请求的采样可靠性。
 
-最新远端执行状态见审计 029：完整 Linux 回归为 795 passed、3 个指定 Windows skip；三套独立 gate 为 11/4/4 个通过且零 skip。当前沙箱本身仍缺少受支持 Python 和可用官方二进制；不要混淆本地与远端结果。
+最新远端执行状态见审计 030：完整 Linux 回归为 809 passed、3 个指定 Windows skip；三套独立 gate 为 11/4/4 个通过且零 skip。当前沙箱本身仍缺少受支持 Python 和可用官方二进制；不要混淆本地与远端结果。
 
 ## 4. 可选：显式启用 GitHub Actions 验收
 
@@ -159,3 +159,11 @@ PR #2 的标签入口已经实际触发：[run 36399985871](https://github.com/w
 审计 029 将 Linux `.owner.json` 更新改为同目录 0600 临时文件 → 文件 fsync → 原子替换 → 目录 fsync，避免发布前失败截断旧记录。若崩溃留下 `.owner-*.tmp`，既有恢复白名单会要求人工复核，保留现场；不要自动删掉临时文件来绕过阻塞。发布后同步失败会报错，不假装回滚或宣称断电持久性已验收。
 
 [run 36417115761](https://github.com/wpuu/NodeLab/actions/runs/36417115761)，head `98b8d6c9bfab1c041f3cc2e20b56111dc55fa657`：完整回归 **795 passed、3 个指定 Windows skip**，独立 gate 11/4/4 全过且零 skip；check `108910796275` 的固定 annotations 已核对。新增 11 项后 full 总数为 798，Windows 发布路径和生产门禁未改变。
+
+### Linux 停止失败时保留恢复依据
+
+审计 030 改变 Linux 失败清理：仍尝试删除 YAML 和非恢复负载，但保留 `.owner.json`/`.owner-*.tmp` 与私有目录。owned close 仍失败并保持锁/进程所有权；stale recovery 停止未确认时仍失败并保留 stale lock，不销毁最后的身份记录。后续确认停止才完整删除。临时 marker 依然阻塞自动恢复；owner 退出后的 stale 残留可能阻塞新运行，不要盲删记录绕过。
+
+[run 36419262286](https://github.com/wpuu/NodeLab/actions/runs/36419262286)，head `be17ca75378cca7e43684702f43ff0df444f9fdd`：完整回归 **809 passed、3 个指定 Windows skip**，独立 gate 11/4/4 全过且零 skip，check `108917763864` 的固定 annotations 已核对。新增 14 项包括真实 owner 退出、child 存活、恢复重试和稳定 pidfd 退出证据；full 总数为 812。
+
+本轮仅保护已成功记录的 child 身份；创建到首次 marker 发布的窗口仍未解决，文件系统错误也可能阻止 YAML 删除。Windows 保留策略未迁移/验收，未进行主机重启或断电测试，生产门禁继续关闭。
