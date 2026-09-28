@@ -129,3 +129,67 @@ def test_protocol_gate_requires_all_four_cases(ready, monkeypatch, capsys, count
     assert value["status"] == status
     assert value["route_proof"] == ("LOCAL_FIXTURE_ONLY" if status == "PASS" else "NOT_RUN")
     assert value["real_node_test_allowed"] is False
+
+
+@pytest.mark.parametrize("change,expected", [
+    ("none", "PASS"), ("missing", "BLOCKED"), ("extra", "BLOCKED"),
+    ("duplicate", "BLOCKED"), ("unexpected_skip", "BLOCKED"),
+    ("wrong_skip_identity", "BLOCKED"), ("xfail", "BLOCKED"),
+    ("windows_not_skipped", "BLOCKED"), ("failure", "FAIL"),
+    ("error", "FAIL"), ("nonzero", "FAIL"),
+])
+def test_full_regression_requires_exact_count_and_named_windows_skips(ready, monkeypatch, capsys, change, expected):
+    import xml.etree.ElementTree as ET
+
+    def run(args, **kwargs):
+        assert str(gate.ROOT / "tests") in args
+        tree = ET.Element("testsuites")
+        suite = ET.SubElement(tree, "testsuite")
+        rows = []
+        for i in range(gate.FULL_EXPECTED_CASES - 3):
+            rows.append(ET.SubElement(suite, "testcase", classname="tests.test_sample", name=f"test_case_{i}"))
+        for module, name in sorted(gate.WINDOWS_SKIPS):
+            row = ET.SubElement(suite, "testcase", classname=module, name=name)
+            ET.SubElement(row, "skipped", type="pytest.skip")
+        if change == "missing":
+            suite.remove(rows[-1])
+        elif change == "extra":
+            ET.SubElement(suite, "testcase", classname="tests.test_sample", name="test_extra")
+        elif change == "duplicate":
+            rows[1].set("name", rows[0].get("name"))
+        elif change == "unexpected_skip":
+            ET.SubElement(rows[0], "skipped", type="pytest.skip")
+        elif change == "wrong_skip_identity":
+            suite[-1].set("name", "test_not_windows")
+        elif change == "xfail":
+            suite[-1].find("skipped").set("type", "pytest.xfail")
+        elif change == "windows_not_skipped":
+            suite[-1].remove(suite[-1].find("skipped"))
+        elif change in ("failure", "error"):
+            ET.SubElement(rows[0], change).text = "private-raw-output"
+        ET.ElementTree(tree).write(args[args.index("--junitxml") + 1])
+        return subprocess.CompletedProcess(args, 1 if change == "nonzero" else 0)
+
+    monkeypatch.setattr(gate.subprocess, "run", run)
+    assert gate.main(ready + ["--suite", "full"]) == (0 if expected == "PASS" else 2)
+    value = output(capsys)
+    assert value["gate"] == "LINUX_FULL_REGRESSION"
+    assert value["status"] == expected
+    assert "private-raw-output" not in json.dumps(value)
+    if expected == "PASS":
+        assert value["passed"] == gate.FULL_EXPECTED_CASES - 3
+        assert value["skipped"] == 3
+        assert value["code"] == "FULL_REGRESSION_OK"
+
+
+def test_failure_ids_never_include_parameters_or_raw_exception_text():
+    import xml.etree.ElementTree as ET
+    sentinel = secrets.token_urlsafe(32)
+    known = ET.Element("testcase", classname="tests.test_engine_binary",
+                       name=f"test_real_binary_reports_the_pinned_version[{sentinel}]")
+    ET.SubElement(known, "failure").text = sentinel
+    unknown = ET.Element("testcase", classname=sentinel, name=sentinel)
+    ET.SubElement(unknown, "error").text = sentinel
+    assert gate.safe_failure_ids([known, unknown]) == [
+        "UNCLASSIFIED", "tests.test_engine_binary::test_real_binary_reports_the_pinned_version",
+    ]

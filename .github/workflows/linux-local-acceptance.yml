@@ -80,12 +80,18 @@ jobs:
           python scripts/f2_session_gate.py --suite vless-tcp \
             --exe "$PWD/tools/mihomo/mihomo" | tee tools/acceptance-report/vless-tcp.json
 
+      - name: Full Linux regression with pinned engine
+        if: ${{ !cancelled() && steps.prepare.outcome == 'success' && steps.dependencies.outcome == 'success' }}
+        run: |
+          python scripts/f2_session_gate.py --suite full \
+            --exe "$PWD/tools/mihomo/mihomo" | tee tools/acceptance-report/full.json
+
       # These are the same fixed-field JSON reports already printed by gates.
       # Check annotations remain API-readable when artifact downloads are blocked.
       - name: Publish fixed-field check annotations
         if: ${{ !cancelled() && steps.prepare.outcome != 'skipped' }}
         run: |
-          for report in preparation session trojan-tcp vless-tcp; do
+          for report in preparation session trojan-tcp vless-tcp full; do
             path="tools/acceptance-report/$report.json"
             if [[ -f "$path" ]]; then
               printf '::notice title=Local acceptance %s::%s\n' "$report" "$(cat "$path")"
@@ -102,5 +108,6 @@ jobs:
             tools/acceptance-report/session.json
             tools/acceptance-report/trojan-tcp.json
             tools/acceptance-report/vless-tcp.json
+            tools/acceptance-report/full.json
           if-no-files-found: warn
           retention-days: 7

@@ -49,7 +49,7 @@ def test_preparation_uses_https_fixed_resource_and_offline_verifier():
     assert "--insecure" not in command and "curl -k" not in command
 
 
-@pytest.mark.parametrize("suite", ["session", "trojan-tcp", "vless-tcp"])
+@pytest.mark.parametrize("suite", ["session", "trojan-tcp", "vless-tcp", "full"])
 def test_each_gate_runs_without_masking_failure_and_has_exact_report(suite):
     matches = [step for step in STEPS if f"--suite {suite} " in step.get("run", "")]
     assert len(matches) == 1
@@ -69,7 +69,7 @@ def test_artifact_upload_is_explicit_allowlist_not_logs_or_runtime():
     upload = next(step for step in STEPS if step.get("uses", "").startswith("actions/upload-artifact@"))
     assert set(upload["with"]["path"].splitlines()) == {
         f"tools/acceptance-report/{name}.json"
-        for name in ("preparation", "session", "trojan-tcp", "vless-tcp")
+        for name in ("preparation", "session", "trojan-tcp", "vless-tcp", "full")
     }
     assert upload["with"]["retention-days"] == 7
     assert "!cancelled()" in upload["if"]
@@ -78,7 +78,7 @@ def test_artifact_upload_is_explicit_allowlist_not_logs_or_runtime():
 
 def test_annotations_only_publish_known_fixed_field_reports():
     step = next(step for step in STEPS if step["name"] == "Publish fixed-field check annotations")
-    assert "for report in preparation session trojan-tcp vless-tcp; do" in step["run"]
+    assert "for report in preparation session trojan-tcp vless-tcp full; do" in step["run"]
     assert 'path="tools/acceptance-report/$report.json"' in step["run"]
     assert "::notice title=Local acceptance" in step["run"]
     assert "!cancelled()" in step["if"]
