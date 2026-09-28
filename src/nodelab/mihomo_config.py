@@ -1045,6 +1045,26 @@ class _Recovery:
             return "SECRET_CLEANUP_FAILED"
         return "PROCESS_STOP_FAILED" if stop_failed else None
 
+    def _recover_linux_dir_locked(self, run_dir: Path) -> str | None:
+        lock = self.root / (run_dir.name + _LOCK_SUFFIX)
+        try:
+            fd = _acquire_linux_recovery_lock(lock)
+        except (OSError, ValueError, PrivateRunError):
+            return "RECOVERY_REVIEW_REQUIRED"
+        try:
+            code = self.recover_dir(run_dir)
+            if code is None:
+                # Transfer descriptor ownership to release, which closes even
+                # when path verification/unlink fails. Never probe our own lock.
+                held, fd = fd, None
+                _release_linux_recovery_lock(lock, held)
+            return code
+        finally:
+            if fd is not None:
+                # Failed/reviewed recovery keeps a stale lock as evidence,
+                # including one newly created for previously missing locks.
+                os.close(fd)
+
     @staticmethod
     def _remove_stale_lock(lock: Path) -> str | None:
         if sys.platform == "linux":
@@ -1103,10 +1123,13 @@ class _Recovery:
                     # newly held locks must not authorize process/file actions.
                     rows.append(_recovery_row(number, "RECOVERY_REVIEW_REQUIRED"))
                     continue
-                code = self.recover_dir(entry)
-                if code is None or (code == "PROCESS_STOP_FAILED" and sys.platform != "linux"):
-                    lock_code = self._remove_stale_lock(self.root / (entry.name + _LOCK_SUFFIX))
-                    code = code or lock_code
+                if sys.platform == "linux":
+                    code = self._recover_linux_dir_locked(entry)
+                else:
+                    code = self.recover_dir(entry)
+                    if code is None or code == "PROCESS_STOP_FAILED":
+                        lock_code = self._remove_stale_lock(self.root / (entry.name + _LOCK_SUFFIX))
+                        code = code or lock_code
                 rows.append(_recovery_row(number, code))
             except (OSError, ValueError, PrivateRunError, ProcessLifecycleError):
                 rows.append(_recovery_row(number, "SECRET_CLEANUP_FAILED"))

@@ -470,6 +470,12 @@ def test_recovery_never_touches_unverifiable_residue_or_foreign_pids(tmp_path: P
                 ctx.close()  # the synthetic test always cleans its own fixtures
             except PrivateRunError:
                 pass
+    if sys.platform == "linux":
+        # Recovery now creates/retains a run lock even for a missing lock on a
+        # reviewed directory. The original owner cannot release an fd it no
+        # longer owns; explicitly recover these now-orphaned test locks.
+        leftover = recover_stale_runs(abandoned[0].root)
+        assert all(row["error_code"] is None for row in leftover)
     assert not [entry for entry in abandoned[0].root.iterdir()]
 
 
