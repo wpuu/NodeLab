@@ -547,6 +547,9 @@ class RunContext:
         self.raw_child: subprocess.Popen | None = None
         self._windows_owner_sid: str | None = None
         self._linux_boot: str | None = None
+        self._initial_dir_fd: int | None = None
+        self._failed_enter = False
+        self._failed_enter_clean = False
         self._private_tree_removed = False
         self._launch_unclaimed = False
         self._lock_path: Path | None = None
@@ -672,7 +675,7 @@ class RunContext:
                     temporary.unlink(missing_ok=True)
 
     def __enter__(self) -> "RunContext":
-        if self.active or self.closed or self.run_dir is not None:
+        if self.active or self.closed or self.run_dir is not None or self._failed_enter:
             raise PrivateRunError()
         try:
             self._ensure_root()
@@ -686,6 +689,11 @@ class RunContext:
                 self._lock_fd = _acquire_lock(self._lock_path)
                 self.run_dir = self.root / self.run_id
                 self.run_dir.mkdir(mode=0o700)
+                if sys.platform == "linux":
+                    # Only after successful mkdir; pin the inode through all
+                    # initialization and root-admission release failure paths.
+                    self._initial_dir_fd = os.open(
+                        self.run_dir, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
                 if os.name == "nt":
                     _restrict_new_windows(self.run_dir, self._windows_owner_sid, directory=True)
                 else:
@@ -703,8 +711,35 @@ class RunContext:
             if sys.platform == "linux":
                 self._cleanup_empty_failed_enter()
             raise
+        finally:
+            if self._initial_dir_fd is not None:
+                fd, self._initial_dir_fd = self._initial_dir_fd, None
+                os.close(fd)
 
     def _cleanup_empty_failed_enter(self) -> None:
+        if sys.platform == "linux":
+            self._failed_enter = True
+            self._failed_enter_clean = self.run_dir is None
+            try:
+                if self.run_dir is not None and self._initial_dir_fd is not None:
+                    held, named = os.fstat(self._initial_dir_fd), self.run_dir.lstat()
+                    self._verify(self.run_dir, directory=True)
+                    if (stat.S_ISDIR(held.st_mode) and held.st_uid == os.getuid()
+                            and stat.S_IMODE(held.st_mode) == 0o700
+                            and (held.st_dev, held.st_ino) == (named.st_dev, named.st_ino)):
+                        shutil.rmtree(self.run_dir)
+                        self._failed_enter_clean = not (self.run_dir.exists() or self.run_dir.is_symlink())
+            except (OSError, ValueError, PrivateRunError):
+                pass
+            finally:
+                if self._lock_fd is not None:
+                    fd, self._lock_fd = self._lock_fd, None
+                    try:
+                        _release_linux_recovery_lock(self._lock_path, fd)
+                    except (OSError, ValueError, PrivateRunError):
+                        self._failed_enter_clean = False
+                self.active = False
+            return
         if self.run_dir is not None:
             try:
                 if self.run_dir.is_dir() and not _is_reparse(self.run_dir):
@@ -923,6 +958,13 @@ class RunContext:
 
     def close(self) -> None:
         if self.closed:
+            return
+        if sys.platform == "linux" and self._failed_enter:
+            # No initialized context or child exists. Never let a later close
+            # re-enter ordinary pathname-based cleanup after ownership failed.
+            if not self._failed_enter_clean:
+                raise PrivateRunError("SECRET_CLEANUP_FAILED") from None
+            self.closed = True
             return
         if self.run_dir is None:
             self.closed = True
