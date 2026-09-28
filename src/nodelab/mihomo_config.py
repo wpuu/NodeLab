@@ -48,6 +48,32 @@ _LINUX_BOOT_ID = Path("/proc/sys/kernel/random/boot_id")
 _BOOT_FINGERPRINT = re.compile(r"[0-9a-f]{64}\Z")
 
 
+
+def _read_linux_marker(path: Path) -> str | None:
+    """Validate the opened object and bound the read, not just its pathname.
+
+    NONBLOCK prevents a substituted FIFO from waiting for a writer before
+    fstat can reject it. NOFOLLOW applies to the final component only; this
+    is not protection against arbitrary hostile ancestor replacement.
+    """
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+        try:
+            info = os.fstat(fd)
+            if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid()
+                    or stat.S_IMODE(info.st_mode) != 0o600 or info.st_nlink != 1
+                    or info.st_size > _MARKER_MAX_BYTES):
+                return None
+            data = os.read(fd, _MARKER_MAX_BYTES + 1)
+            if len(data) > _MARKER_MAX_BYTES:
+                return None
+            return data.decode("utf-8", "strict")
+        finally:
+            os.close(fd)
+    except (OSError, ValueError, UnicodeError):
+        return None
+
+
 def _unique_marker_fields(pairs):
     result = {}
     for key, value in pairs:
@@ -801,8 +827,12 @@ class _Recovery:
             return None
         self.verify(marker, directory=False)
         try:
-            data = json.loads(marker.read_text(encoding="utf-8"), object_pairs_hook=_unique_marker_fields)
-        except (ValueError, UnicodeError):
+            text = (_read_linux_marker(marker) if sys.platform == "linux"
+                    else marker.read_text(encoding="utf-8"))
+            if text is None:
+                return None
+            data = json.loads(text, object_pairs_hook=_unique_marker_fields)
+        except (ValueError, UnicodeError, RecursionError):
             return None
         if not isinstance(data, dict) or data.get("run_id") != run_dir.name:
             return None
