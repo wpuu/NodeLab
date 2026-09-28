@@ -29,7 +29,7 @@ import yaml
 
 from nodelab.mihomo_process import (
     MihomoProcess, ProcessIdentity, ProcessLifecycleError, process_identity,
-    stop_owned_process, terminate_verified_process,
+    stop_owned_process, terminate_verified_process, linux_owner_gone,
 )
 
 PROBE_GROUP = "PROBE"
@@ -868,7 +868,11 @@ class _Recovery:
         stop_failed = False
         if marker is not None:
             owner_pid, owner_stamp = marker.get("owner_pid"), marker.get("owner_create_time")
-            if owner_pid is not None and owner_stamp is not None:
+            if sys.platform == "linux":
+                owner = ProcessIdentity(owner_pid, owner_stamp, marker.get("owner_exe_fingerprint"))
+                if linux_owner_gone(owner) is not True:
+                    return "RECOVERY_REVIEW_REQUIRED"
+            elif owner_pid is not None and owner_stamp is not None:
                 owner = ProcessIdentity(owner_pid, owner_stamp, marker.get("owner_exe_fingerprint"))
                 if owner.matches(process_identity(owner_pid)):
                     return "RECOVERY_REVIEW_REQUIRED"  # owner alive without its lock: never touch

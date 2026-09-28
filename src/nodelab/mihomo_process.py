@@ -156,6 +156,42 @@ def _recovery_identity(value: ProcessIdentity | None) -> bool:
                   and all(c in "0123456789abcdef" for c in value.exe_fingerprint))))
 
 
+
+def linux_owner_gone(expected: ProcessIdentity) -> bool:
+    """Read-only recovery proof: unknown owner is NOT permission to proceed.
+
+    A different executable with the same creation stamp may be exec(), not
+    owner death. Only kernel absence/readiness or a known different creation
+    stamp establishes that this recorded owner is no longer the live owner.
+    """
+    if not _recovery_identity(expected) or not hasattr(os, "pidfd_open"):
+        return False
+    try:
+        fd = os.pidfd_open(expected.pid)
+    except ProcessLookupError:
+        return True
+    except (OSError, ValueError, OverflowError):
+        return False
+    try:
+        def exited() -> bool:
+            ready, _, _ = select.select([fd], [], [], 0.0)
+            return bool(ready)
+
+        if exited():
+            return True
+        current = _linux_identity(expected.pid)
+        if (_recovery_identity(current) and current.pid == expected.pid
+                and current.create_time != expected.create_time):
+            return True
+        # Missing /proc data, missing executable data, or exec with the same
+        # PID/start stamp does not prove exit. Recheck only the bound pidfd.
+        return exited()
+    except (OSError, ValueError):
+        return False
+    finally:
+        os.close(fd)
+
+
 def terminate_verified_process(expected: ProcessIdentity, *, budget: float = STOP_BUDGET_SECONDS) -> bool:
     """Terminate a pid only while it still is exactly `expected`; True when gone.
 
