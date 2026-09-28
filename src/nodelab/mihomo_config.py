@@ -619,13 +619,31 @@ class RunContext:
         # skip deleting the plaintext: an orphaned synthetic child is far less
         # harmful than a credential left on disk.  Both steps always run and
         # a single fixed code reports if either one is not confirmed.
-        stopped = self._stop_child()
-        removed = self._remove_private_tree()
+        stopped = removed = False
+        try:
+            try:
+                stopped = self._stop_child() is True
+            except BaseException:
+                # An unexpected wrapper error or cancellation must not bypass
+                # the plaintext deletion attempt. Unknown stop remains FAIL;
+                # do not reset its stop budget or kill a guessed replacement.
+                pass
+        finally:
+            try:
+                removed = self._remove_private_tree() is True
+            except BaseException:
+                pass
         if not (stopped and removed):
             # Never report a prior success if process/file cleanup is unknown.
             # The lock stays held: the residue is still owned, not stale.
-            raise PrivateRunError("SECRET_CLEANUP_FAILED")
-        self._drop_lock()
+            # Suppress even an earlier body exception that may contain secrets.
+            raise PrivateRunError("SECRET_CLEANUP_FAILED") from None
+        try:
+            self._drop_lock()
+        except BaseException:
+            # Lock release may have partially completed. Do not claim closed
+            # or echo the underlying exception; a later close can retry.
+            raise PrivateRunError("SECRET_CLEANUP_FAILED") from None
         self.closed = True
         self.active = False
 
