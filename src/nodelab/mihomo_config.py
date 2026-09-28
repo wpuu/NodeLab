@@ -23,6 +23,7 @@ import tempfile
 import time
 from pathlib import Path
 from typing import Any
+from uuid import UUID
 
 import yaml
 
@@ -43,6 +44,33 @@ _LOCK_SUFFIX = ".lock"
 _RECOVER_LOCK = ".recover" + _LOCK_SUFFIX
 _MARKER = ".owner.json"
 _MARKER_MAX_BYTES = 4096
+_LINUX_BOOT_ID = Path("/proc/sys/kernel/random/boot_id")
+_BOOT_FINGERPRINT = re.compile(r"[0-9a-f]{64}\Z")
+
+
+def _unique_marker_fields(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("RECOVERY_REVIEW_REQUIRED")
+        result[key] = value
+    return result
+
+
+def _linux_boot_fingerprint() -> str | None:
+    """Bounded read of this boot, storing an opaque domain-separated digest."""
+    try:
+        with _LINUX_BOOT_ID.open("rb") as source:
+            data = source.read(65)
+        if len(data) > 64:
+            return None
+        value = data.decode("ascii", "strict").strip()
+        if str(UUID(value)) != value:
+            return None
+        return hashlib.sha256(b"nodelab-linux-boot-v1\0" + value.encode("ascii")).hexdigest()
+    except (OSError, ValueError, UnicodeError):
+        return None
+
 _ACL_CHECK_SCRIPT = r"""
 $ErrorActionPreference = 'Stop'
 $target = [Environment]::GetEnvironmentVariable('NODELAB_PRIVATE_PATH', 'Process')
@@ -354,6 +382,7 @@ class RunContext:
         self.process: MihomoProcess | None = None
         self.raw_child: subprocess.Popen | None = None
         self._windows_owner_sid: str | None = None
+        self._linux_boot: str | None = None
         self._private_tree_removed = False
         self._lock_path: Path | None = None
         self._lock_fd: int | None = None
@@ -409,6 +438,12 @@ class RunContext:
 
     def _write_marker(self, *, child: ProcessIdentity | None = None) -> None:
         assert self.run_dir is not None and self.run_id is not None
+        if sys.platform == "linux":
+            current_boot = _linux_boot_fingerprint()
+            if (current_boot is None or
+                    (self._linux_boot is not None and current_boot != self._linux_boot)):
+                raise PrivateRunError("RECOVERY_REVIEW_REQUIRED")
+            self._linux_boot = current_boot
         marker = self.run_dir / _MARKER
         if not marker.exists():
             self._new_file(_MARKER)
@@ -426,6 +461,8 @@ class RunContext:
             "child_create_time": child.create_time if child else None,
             "child_exe_fingerprint": child.exe_fingerprint if child else None,
         }
+        if sys.platform == "linux":
+            value["linux_boot_fingerprint"] = self._linux_boot
         with marker.open("w", encoding="utf-8") as f:
             json.dump(value, f, sort_keys=True)
             f.flush()
@@ -682,11 +719,22 @@ class _Recovery:
         if not marker.is_file() or _is_reparse(marker) or marker.stat().st_size > _MARKER_MAX_BYTES:
             return None
         self.verify(marker, directory=False)
-        data = json.loads(marker.read_text(encoding="utf-8"))
+        try:
+            data = json.loads(marker.read_text(encoding="utf-8"), object_pairs_hook=_unique_marker_fields)
+        except (ValueError, UnicodeError):
+            return None
         if not isinstance(data, dict) or data.get("run_id") != run_dir.name:
             return None
         if data.get("run_dir_fingerprint") != _dir_fingerprint(run_dir):
             return None
+        if sys.platform == "linux":
+            recorded = data.get("linux_boot_fingerprint")
+            current = _linux_boot_fingerprint()
+            # Legacy/unreadable/other-boot records cannot authorize PID lookup,
+            # signalling or automatic removal. Never silently rebind them.
+            if (type(recorded) is not str or not _BOOT_FINGERPRINT.fullmatch(recorded)
+                    or current is None or recorded != current):
+                return None
         for key in ("owner_pid", "child_pid", "owner_create_time", "child_create_time"):
             if data.get(key) is not None and type(data.get(key)) is not int:
                 return None
