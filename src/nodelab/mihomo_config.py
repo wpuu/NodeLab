@@ -74,6 +74,21 @@ def _read_linux_marker(path: Path) -> str | None:
         return None
 
 
+
+def _valid_linux_child_record(data: dict[str, Any]) -> bool:
+    # Missing keys are not equivalent to the explicit no-child record written
+    # by RunContext. A partial identity must not authorize deletion or signals.
+    fields = ("child_pid", "child_create_time", "child_exe_fingerprint")
+    if any(key not in data for key in fields):
+        return False
+    pid, stamp, fingerprint = (data[key] for key in fields)
+    if pid is None and stamp is None and fingerprint is None:
+        return True
+    return (type(pid) is int and pid > 0 and type(stamp) is int and stamp > 0
+            and type(fingerprint) is str and len(fingerprint) == 32
+            and all(c in "0123456789abcdef" for c in fingerprint))
+
+
 def _unique_marker_fields(pairs):
     result = {}
     for key, value in pairs:
@@ -852,6 +867,8 @@ class _Recovery:
         for key in ("owner_exe_fingerprint", "child_exe_fingerprint"):
             if data.get(key) is not None and type(data.get(key)) is not str:
                 return None
+        if sys.platform == "linux" and not _valid_linux_child_record(data):
+            return None
         return data
 
     def recover_dir(self, run_dir: Path) -> str | None:
@@ -862,6 +879,8 @@ class _Recovery:
         entries = {entry.name for entry in run_dir.iterdir()}
         if not entries <= {_MARKER, "probe.yaml"}:
             return "RECOVERY_REVIEW_REQUIRED"  # not a tree this application creates
+        if sys.platform == "linux" and _MARKER not in entries:
+            return "RECOVERY_REVIEW_REQUIRED"  # even an empty tree lacks owner evidence
         marker = self.read_marker(run_dir) if _MARKER in entries else None
         if marker is None and _MARKER in entries:
             return "RECOVERY_REVIEW_REQUIRED"
