@@ -58,11 +58,11 @@ tools/runtime/acceptance/bin/python scripts/f2_session_gate.py \
 - `session`：精确 11 个用例通过且零 skip；合成会话范围，不是实际代理协议证明。
 - `trojan-tcp`：精确 4 个用例通过且零 skip；实际本机 Trojan/TLS/TCP。
 - `vless-tcp`：精确 4 个用例通过且零 skip；实际本机 VLESS v0/零 addons/TLS/TCP。
-- `full`：当前精确 891 个 testcase，要求 888 passed，只允许三个指定 Windows 测试以 pytest.skip 跳过；不是任意三个 skip。失败诊断仅发布源码白名单中的测试函数标识，不包含参数或异常文本。增减测试时须审阅并更新 `FULL_EXPECTED_CASES`。
+- `full`：当前精确 900 个 testcase，要求 897 passed，只允许三个指定 Windows 测试以 pytest.skip 跳过；不是任意三个 skip。失败诊断仅发布源码白名单中的测试函数标识，不包含参数或异常文本。增减测试时须审阅并更新 `FULL_EXPECTED_CASES`。
 - 所有 gate 都要求固定二进制校验；不会接受环境变量提供的自定义摘要作为验收替代。
 - 即使协议 gate 通过，范围也仅为 `LOCAL_FIXTURE_ONLY`；不覆盖外部节点、Vision/WS/gRPC/Reality、Windows 或普通短请求的采样可靠性。
 
-最新远端执行状态见审计 034：完整 Linux 回归为 888 passed、3 个指定 Windows skip；三套独立 gate 为 11/4/4 个通过且零 skip。当前沙箱本身仍缺少受支持 Python 和可用官方二进制；不要混淆本地与远端结果。
+最新远端执行状态见审计 035：完整 Linux 回归为 897 passed、3 个指定 Windows skip；三套独立 gate 为 11/4/4 个通过且零 skip。当前沙箱本身仍缺少受支持 Python 和可用官方二进制；不要混淆本地与远端结果。
 
 ## 4. 可选：显式启用 GitHub Actions 验收
 
@@ -193,3 +193,11 @@ PR #2 的标签入口已经实际触发：[run 36399985871](https://github.com/w
 [run 36442505342](https://github.com/wpuu/NodeLab/actions/runs/36442505342)，head `bcdad0b9d14dc592e411c2a4099192f54ecfc007`：完整回归 **888 passed、3 个指定 Windows skip**，独立 gate 11/4/4 全过且零 skip，check `108996326066` 固定 annotations 已核对。新增 15 项含真实 owner 在 child 创建后、Popen 返回前直接退出；full 总数为 891。
 
 该创建窗口现在可留下明确的“必须复核”记录，不等于已能自动找回未知 PID。若 owner 未执行 close 就退出，YAML 也可能留在私有目录；旧版本未写意图的事故不能补回证据。Windows 持久化协议、断电/重启与生产授权仍未验收。
+
+### Linux child exec 不再误报退出
+
+审计 035 修正记录恢复对 executable 变化的解释：同 PID/创建时间但路径指纹变化可能只是 exec，不能当作 child 已退出；不向这种已观察到身份变化的进程发信号，仅用绑定 pidfd 再确认退出。查询结果 PID 不一致也不证明复用。child 仍活时恢复报 PROCESS_STOP_FAILED、尝试删 YAML、保留 marker；不改绑到新 executable。
+
+[run 36445073974](https://github.com/wpuu/NodeLab/actions/runs/36445073974)，head `7a53b1e9539449bd5ece88f468a6ed273bd05930`：完整回归 **897 passed、3 个指定 Windows skip**，独立 gate 11/4/4 全过且零 skip，check `109005145141` 固定 annotations 已核对。新增 9 项含真实 Python→shell exec，full 总数为 900。
+
+这不冻结进程映像，也不消除查询之后/信号之间的 exec 竞态；路径指纹不是内容摘要。Windows、未知 PID 自动恢复及生产授权仍未验收。
