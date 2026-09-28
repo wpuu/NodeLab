@@ -2,8 +2,9 @@
 
 The former sing-box-shaped config generator is intentionally unavailable
 until F2 implements the fixed Mihomo v1.19.31 schema.  This module currently
-provides only a protected temporary run and exact-child ownership for
-synthetic safety tests; it is not authority to probe a real node.
+provides a protected temporary run and exact-child ownership for synthetic
+safety tests and the internal F2 engine session; it is not authority to probe
+a real node.
 """
 
 from __future__ import annotations
@@ -427,6 +428,8 @@ class RunContext:
         }
         with marker.open("w", encoding="utf-8") as f:
             json.dump(value, f, sort_keys=True)
+            f.flush()
+            os.fsync(f.fileno())
 
     def __enter__(self) -> "RunContext":
         if self.active or self.closed or self.run_dir is not None:
@@ -477,7 +480,8 @@ class RunContext:
         attempt, contract F.4); the existing file is re-verified as ours and
         truncated, never followed through a link.
         """
-        if not self.active or self.run_dir is None or not isinstance(value, dict):
+        if (not self.active or self.run_dir is None or not isinstance(value, dict)
+                or self.raw_child is not None):
             raise PrivateRunError()
         try:
             path = self.run_dir / "probe.yaml"
@@ -498,6 +502,57 @@ class RunContext:
         except Exception:
             # PyYAML/custom mapping errors may themselves contain a secret.
             raise PrivateRunError("CONFIG_BUILD_FAILED") from None
+
+    def _spawn_engine(self, exe: Path, *, config_test: bool = False) -> subprocess.Popen:
+        """Internal: own the child immediately, before wrapper/marker work.
+
+        The session verifies the pinned executable first. Only the fixed
+        private YAML path and fixed engine flags can be passed here.
+        """
+        if (not self.active or self.closed or self.run_dir is None
+                or self.raw_child is not None or self.process is not None):
+            raise PrivateRunError("PROCESS_START_FAILED")
+        try:
+            path = self.run_dir / "probe.yaml"
+            self._verify(self.run_dir, directory=True)
+            if _is_reparse(path):
+                raise PrivateRunError()
+            self._verify(path, directory=False)
+            command = [str(exe)] + (["-t"] if config_test else [])
+            command += ["-d", str(self.run_dir), "-f", str(path)]
+            proc = subprocess.Popen(
+                command, cwd=str(self.run_dir), stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, close_fds=True,
+            )
+            self.raw_child = proc
+            self.process = MihomoProcess(proc)
+            identity = process_identity(proc.pid)
+            if identity is None or identity.exe_fingerprint is None:
+                # A very short-lived -t may already be gone. It needs no
+                # recovery identity, but a live unverifiable child is unsafe.
+                if proc.poll() is None:
+                    raise PrivateRunError("PROCESS_START_FAILED")
+            self._write_marker(child=identity)
+            return proc
+        except PrivateRunError:
+            raise
+        except Exception:
+            raise PrivateRunError("PROCESS_START_FAILED") from None
+
+    def _finish_engine_check(self) -> None:
+        """Reap -t before clearing its marker and allowing a runtime child."""
+        if self.raw_child is None or self.raw_child.poll() is None:
+            raise PrivateRunError("PROCESS_START_FAILED")
+        if not self._stop_child():
+            raise PrivateRunError("SECRET_CLEANUP_FAILED")
+        try:
+            self._write_marker()
+        except PrivateRunError:
+            raise
+        except Exception:
+            raise PrivateRunError("PROCESS_START_FAILED") from None
+        self.process = None
+        self.raw_child = None
 
     def spawn_synthetic_process(self) -> subprocess.Popen:
         """F1 synthetic child only, for proving own-PID cleanup without Mihomo."""

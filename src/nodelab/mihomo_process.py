@@ -8,6 +8,7 @@ error code. The private RunContext owns configuration removal separately.
 from __future__ import annotations
 
 import hashlib
+import math
 import os
 import select
 import signal
@@ -242,10 +243,14 @@ def stop_owned_process(proc: subprocess.Popen, *, budget: float = STOP_BUDGET_SE
     The whole terminate -> kill -> fallback sequence shares one bounded budget
     (default 5 s, the contract's cleanup window) instead of stacking timeouts.
     """
+    if (type(budget) not in (int, float) or not math.isfinite(budget)
+            or budget <= 0):
+        raise ProcessLifecycleError()
     deadline = time.monotonic() + budget
 
     def remaining(cap: float) -> float:
-        return max(0.1, min(cap, deadline - time.monotonic()))
+        # Never grant a new minimum timeout after the shared budget expired.
+        return max(0.0, min(cap, deadline - time.monotonic()))
 
     try:
         if proc.poll() is None:
@@ -260,6 +265,7 @@ def stop_owned_process(proc: subprocess.Popen, *, budget: float = STOP_BUDGET_SE
             raise ProcessLifecycleError()
     except BaseException:
         # Cancellation during cleanup must not leave our own child alive.
+        # Last-resort kill does not reset the deadline, even at budget expiry.
         try:
             if proc.poll() is None:
                 proc.kill()

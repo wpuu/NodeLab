@@ -1,0 +1,86 @@
+name: Linux local engine acceptance
+
+# Deliberately manual: no PR, push, schedule, external node, or credential input.
+"on":
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: linux-local-acceptance-${{ github.ref }}
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  local-acceptance:
+    runs-on: ubuntu-24.04
+    # A runner timeout/cancellation is NOT cleanup or acceptance evidence.
+    timeout-minutes: 20
+    steps:
+      - name: Checkout selected revision
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - name: Set up supported Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: '3.12'
+
+      - name: Install project and test dependencies
+        id: dependencies
+        run: |
+          python -m pip install -e . pytest
+          command -v openssl >/dev/null
+
+      - name: Download and prepare pinned official bytes
+        id: prepare
+        run: |
+          umask 077
+          mkdir -p tools/downloads tools/mihomo tools/acceptance-report
+          curl --fail --silent --show-error --location \
+            --proto '=https' --proto-redir '=https' \
+            --connect-timeout 15 --max-time 180 \
+            --output tools/downloads/mihomo.gz \
+            https://github.com/MetaCubeX/mihomo/releases/download/v1.19.31/mihomo-linux-amd64-compatible-v1.19.31.gz
+          python scripts/prepare_mihomo_linux.py \
+            --archive "$PWD/tools/downloads/mihomo.gz" \
+            --destination "$PWD/tools/mihomo/mihomo" \
+            | tee tools/acceptance-report/preparation.json
+
+      # Preserve a failed job while still trying the independent gates. Never
+      # continue-on-error: even one BLOCKED/FAIL must prevent a green job.
+      - name: Synthetic real-engine session gate
+        if: ${{ !cancelled() && steps.prepare.outcome == 'success' && steps.dependencies.outcome == 'success' }}
+        run: |
+          python scripts/f2_session_gate.py --suite session \
+            --exe "$PWD/tools/mihomo/mihomo" | tee tools/acceptance-report/session.json
+
+      - name: Local Trojan TLS TCP gate
+        if: ${{ !cancelled() && steps.prepare.outcome == 'success' && steps.dependencies.outcome == 'success' }}
+        run: |
+          python scripts/f2_session_gate.py --suite trojan-tcp \
+            --exe "$PWD/tools/mihomo/mihomo" | tee tools/acceptance-report/trojan-tcp.json
+
+      - name: Local VLESS TLS TCP gate
+        if: ${{ !cancelled() && steps.prepare.outcome == 'success' && steps.dependencies.outcome == 'success' }}
+        run: |
+          python scripts/f2_session_gate.py --suite vless-tcp \
+            --exe "$PWD/tools/mihomo/mihomo" | tee tools/acceptance-report/vless-tcp.json
+
+      - name: Retain fixed-field reports only
+        if: ${{ !cancelled() && steps.prepare.outcome != 'skipped' }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: local-gate-results-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            tools/acceptance-report/preparation.json
+            tools/acceptance-report/session.json
+            tools/acceptance-report/trojan-tcp.json
+            tools/acceptance-report/vless-tcp.json
+          if-no-files-found: warn
+          retention-days: 7

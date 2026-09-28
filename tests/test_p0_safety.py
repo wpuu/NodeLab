@@ -639,7 +639,8 @@ def test_p0_07a_verdict_requires_two_route_backed_observations():
                                production=False) == ("FAIL", None)
     assert decide_probe_status(good, good, runtime_verified=True, cleanup_ok=True,
                                production=True) == ("FAIL", None)  # documentation IP, not public
-    assert decide_probe_status(good, good, **(common | {"unsupported": True})) == ("UNSUPPORTED", None)
+    assert decide_probe_status(good, good, **(common | {"unsupported": True})) == ("FAIL", None)
+    assert decide_probe_status(None, None, **(common | {"unsupported": True})) == ("UNSUPPORTED", None)
 
 
 def test_unsafe_parent_or_symlink_never_receives_plaintext(tmp_path: Path):

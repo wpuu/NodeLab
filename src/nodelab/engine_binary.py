@@ -35,6 +35,8 @@ import subprocess
 from pathlib import Path
 from typing import Final
 
+from nodelab.deadline import DeadlineExpired, remaining
+
 PINNED_VERSION: Final[str] = "v1.19.31"
 
 # sha256 -> human descriptor. Extracted from the official release assets on
@@ -52,7 +54,7 @@ PIN_ENV: Final[str] = "NODELAB_MIHOMO_SHA256"
 _BINARY_CODES: Final[frozenset[str]] = frozenset({
     "BINARY_NOT_CONFIGURED", "BINARY_NOT_FOUND", "BINARY_NOT_REGULAR_FILE",
     "BINARY_IS_LINK", "BINARY_WORLD_WRITABLE", "BINARY_DIGEST_MISMATCH",
-    "BINARY_VERSION_MISMATCH", "BINARY_EXEC_FAILED", "BINARY_PIN_INVALID",
+    "BINARY_TIMEOUT", "BINARY_VERSION_MISMATCH", "BINARY_EXEC_FAILED", "BINARY_PIN_INVALID",
 })
 
 _DIGEST_RE = re.compile(r"\A[0-9a-f]{64}\Z")
@@ -75,11 +77,14 @@ class BinaryVerificationError(RuntimeError):
         return f"BinaryVerificationError({self.code})"
 
 
-def file_digest(path: Path) -> str:
+def file_digest(path: Path, *, deadline: float | None = None) -> str:
+    remaining(_VERSION_TIMEOUT, deadline)
     digest = hashlib.sha256()
     with open(path, "rb") as handle:
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            remaining(_VERSION_TIMEOUT, deadline)
             digest.update(chunk)
+    remaining(_VERSION_TIMEOUT, deadline)
     return digest.hexdigest()
 
 
@@ -129,9 +134,10 @@ def resolve_pinned_exe(explicit: Path | str | None = None) -> Path | None:
     return path
 
 
-def verify_pinned_binary(exe: Path | str | None) -> tuple[bool, str]:
+def verify_pinned_binary(exe: Path | str | None, *, deadline: float | None = None) -> tuple[bool, str]:
     """(ok, fixed_code). `ok` means: pinned bytes AND pinned version."""
     try:
+        remaining(_VERSION_TIMEOUT, deadline)
         if exe is None:
             raise BinaryVerificationError("BINARY_NOT_CONFIGURED")
         path = Path(exe)
@@ -139,7 +145,7 @@ def verify_pinned_binary(exe: Path | str | None) -> tuple[bool, str]:
             raise BinaryVerificationError("BINARY_NOT_CONFIGURED")
         _structural_checks(path)
 
-        digest = file_digest(path)
+        digest = file_digest(path, deadline=deadline)
         allowed = set(KNOWN_DIGESTS)
         pin = owner_pin()
         if pin:
@@ -150,10 +156,17 @@ def verify_pinned_binary(exe: Path | str | None) -> tuple[bool, str]:
         try:
             proc = subprocess.run(
                 [str(path), "-v"], stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                timeout=_VERSION_TIMEOUT, text=True, encoding="utf-8", errors="replace",
+                timeout=remaining(_VERSION_TIMEOUT, deadline), text=True, encoding="utf-8", errors="replace",
             )
+        except DeadlineExpired:
+            raise
+        except subprocess.TimeoutExpired:
+            if deadline is not None:
+                remaining(_VERSION_TIMEOUT, deadline)
+            raise BinaryVerificationError("BINARY_EXEC_FAILED") from None
         except (OSError, subprocess.SubprocessError):
             raise BinaryVerificationError("BINARY_EXEC_FAILED") from None
+        remaining(_VERSION_TIMEOUT, deadline)
         if proc.returncode != 0:
             raise BinaryVerificationError("BINARY_EXEC_FAILED")
         # Match a fixed pattern; never return or log the raw banner, which
@@ -162,6 +175,8 @@ def verify_pinned_binary(exe: Path | str | None) -> tuple[bool, str]:
         if not found or found.group(1) != PINNED_VERSION:
             raise BinaryVerificationError("BINARY_VERSION_MISMATCH")
         return True, "BINARY_OK"
+    except DeadlineExpired:
+        return False, "BINARY_TIMEOUT"
     except BinaryVerificationError as error:
         return False, error.code
     except Exception:
