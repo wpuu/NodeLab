@@ -548,6 +548,7 @@ class RunContext:
         self._windows_owner_sid: str | None = None
         self._linux_boot: str | None = None
         self._initial_dir_fd: int | None = None
+        self._run_dir_fd: int | None = None
         self._failed_enter = False
         self._failed_enter_clean = False
         self._private_tree_removed = False
@@ -700,7 +701,11 @@ class RunContext:
                     self._verify(self.run_dir, directory=True)
                 self.active = True
                 self._write_marker()
-                return self
+            if sys.platform == "linux":
+                # Retain the same inode, not a reopened pathname. dup is
+                # non-inheritable; the temporary initialization fd closes below.
+                self._run_dir_fd = os.dup(self._initial_dir_fd)
+            return self
         except PrivateRunError:
             self._cleanup_empty_failed_enter()
             raise
@@ -921,6 +926,15 @@ class RunContext:
             return False
         return True
 
+    def _linux_run_directory_matches(self) -> bool:
+        if self.run_dir is None or self._run_dir_fd is None:
+            return False
+        held, named = os.fstat(self._run_dir_fd), self.run_dir.lstat()
+        return (stat.S_ISDIR(held.st_mode) and stat.S_ISDIR(named.st_mode)
+                and held.st_uid == named.st_uid == os.getuid()
+                and stat.S_IMODE(held.st_mode) == stat.S_IMODE(named.st_mode) == 0o700
+                and (held.st_dev, held.st_ino) == (named.st_dev, named.st_ino))
+
     def _remove_private_tree(self) -> bool:
         """Delete this run's directory (plaintext YAML first); report, never raise."""
         if self._private_tree_removed:
@@ -931,7 +945,11 @@ class RunContext:
             if self.run_dir.parent != self.root or not self.run_dir.is_dir():
                 return False
             self._verify(self.root, directory=True)
+            if sys.platform == "linux" and not self._linux_run_directory_matches():
+                return False
             _check_clean_private_tree(self.run_dir)
+            if sys.platform == "linux" and not self._linux_run_directory_matches():
+                return False
             # rmtree unlinks files before their directory, so probe.yaml is
             # gone even if the directory itself is still a live child's cwd.
             shutil.rmtree(self.run_dir)
@@ -951,6 +969,8 @@ class RunContext:
                 return False
             self._verify(self.root, directory=True)
             self._verify(self.run_dir, directory=True)
+            if sys.platform == "linux" and not self._linux_run_directory_matches():
+                return False
             _remove_payload_preserving_evidence(self.run_dir)
         except (OSError, ValueError, PrivateRunError):
             return False
@@ -998,6 +1018,9 @@ class RunContext:
             raise PrivateRunError("SECRET_CLEANUP_FAILED") from None
         try:
             self._drop_lock()
+            if self._run_dir_fd is not None:
+                fd, self._run_dir_fd = self._run_dir_fd, None
+                os.close(fd)
         except BaseException:
             # Lock release may have partially completed. Do not claim closed
             # or echo the underlying exception; a later close can retry.

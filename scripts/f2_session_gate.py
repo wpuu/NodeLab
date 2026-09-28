@@ -21,7 +21,7 @@ import xml.etree.ElementTree as ET
 ROOT = Path(__file__).resolve().parents[1]
 # Update explicitly when reviewed tests are added/removed; not derived from the
 # report under evaluation. A reduced collection must not authorize itself.
-FULL_EXPECTED_CASES = 1023
+FULL_EXPECTED_CASES = 1035
 WINDOWS_SKIPS = {
     ("tests.test_windows_safety_gate", name) for name in (
         "test_windows_e_volume_dacl_before_and_during_private_yaml",
