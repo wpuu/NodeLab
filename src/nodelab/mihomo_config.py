@@ -445,9 +445,14 @@ class RunContext:
                 raise PrivateRunError("RECOVERY_REVIEW_REQUIRED")
             self._linux_boot = current_boot
         marker = self.run_dir / _MARKER
-        if not marker.exists():
-            self._new_file(_MARKER)
-        self._verify(marker, directory=False)
+        if sys.platform == "linux":
+            self._verify(self.run_dir, directory=True)
+            if marker.exists() or marker.is_symlink():
+                self._verify(marker, directory=False)
+        else:
+            if not marker.exists():
+                self._new_file(_MARKER)
+            self._verify(marker, directory=False)
         owner = process_identity(os.getpid())
         # No credentials, URI, hostname, EXE path, or controller token here:
         # only what recovery needs to prove "same process" and "same dir".
@@ -463,10 +468,43 @@ class RunContext:
         }
         if sys.platform == "linux":
             value["linux_boot_fingerprint"] = self._linux_boot
-        with marker.open("w", encoding="utf-8") as f:
-            json.dump(value, f, sort_keys=True)
-            f.flush()
-            os.fsync(f.fileno())
+        if sys.platform == "linux":
+            self._publish_linux_marker(marker, value)
+        else:
+            with marker.open("w", encoding="utf-8") as f:
+                json.dump(value, f, sort_keys=True)
+                f.flush()
+                os.fsync(f.fileno())
+
+    def _publish_linux_marker(self, marker: Path, value: dict[str, Any]) -> None:
+        # Same-directory exclusive 0600 staging: interrupted serialization
+        # cannot truncate the preceding complete record. A crash may leave a
+        # staging file, which the existing recovery allowlist sends to review.
+        fd, name = tempfile.mkstemp(prefix=".owner-", suffix=".tmp", dir=self.run_dir)
+        temporary = Path(name)
+        try:
+            stream = os.fdopen(fd, "w", encoding="utf-8")
+            fd = None  # stream now owns the descriptor even on serialization failure
+            with stream:
+                self._verify(temporary, directory=False)
+                json.dump(value, stream, sort_keys=True)
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temporary, marker)
+            temporary = None  # publication happened; never unlink the new marker
+            self._verify(marker, directory=False)
+            directory_fd = os.open(self.run_dir, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
+        finally:
+            try:
+                if fd is not None:
+                    os.close(fd)
+            finally:
+                if temporary is not None:
+                    temporary.unlink(missing_ok=True)
 
     def __enter__(self) -> "RunContext":
         if self.active or self.closed or self.run_dir is not None:
