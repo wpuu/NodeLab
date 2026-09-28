@@ -62,7 +62,7 @@ tools/runtime/acceptance/bin/python scripts/f2_session_gate.py \
 - 所有 gate 都要求固定二进制校验；不会接受环境变量提供的自定义摘要作为验收替代。
 - 即使协议 gate 通过，范围也仅为 `LOCAL_FIXTURE_ONLY`；不覆盖外部节点、Vision/WS/gRPC/Reality、Windows 或普通短请求的采样可靠性。
 
-最新远端执行状态见审计 025：完整 Linux 回归为 734 passed、3 个指定 Windows skip；三套独立 gate 为 11/4/4 个通过且零 skip。当前沙箱本身仍缺少受支持 Python 和可用官方二进制；不要混淆本地与远端结果。
+最新远端执行状态见审计 026：完整 Linux 回归为 734 passed、3 个指定 Windows skip；三套独立 gate 为 11/4/4 个通过且零 skip。当前沙箱本身仍缺少受支持 Python 和可用官方二进制；不要混淆本地与远端结果。
 
 ## 4. 可选：显式启用 GitHub Actions 验收
 
@@ -135,3 +135,9 @@ PR #2 的标签入口已经实际触发：[run 36399985871](https://github.com/w
 审计 025 使停止子进程中的意外异常/取消不再跳过私有 YAML 删除尝试；清理未知统一固定失败，不误报 closed，不暴露先前异常文本。删除本身失败仍可能留下明文，这不是断电/强制终止恢复保证。
 
 [run 36410716164](https://github.com/wpuu/NodeLab/actions/runs/36410716164)，head `d044cccdeb5cd303a9fa42a4f8bf92b9faac6648`：完整回归 **734 passed、3 个指定 Windows skip**，三套独立 gate 分别 11/4/4 通过且零 skip；check `108889982043` 的固定 annotations 已核对。新增 12 项后 full 总数为 737，生产授权门禁不变。
+
+### 原生 Node.js 24 Actions 复验
+
+审计 026 将 checkout / setup-python / upload-artifact 更新为已按固定 SHA 核对 `runs.using=node24` 的官方版本，保留只读权限和显式启用策略。报告明确 ZIP 打包，排除隐藏文件；测试总数仍为 737。
+
+[run 36411287183](https://github.com/wpuu/NodeLab/actions/runs/36411287183)，head `1589b4a9123763ab440019a9ca20bfc9ca55e9af`：完整回归 **734 passed、3 个指定 Windows skip**，独立 gate 11/4/4 全过且零 skip。check `108891838127` 仅有五条结果 notice，无此前的 Node 20 弃用注释；报告上传步骤和 artifact 元数据均已核对。
