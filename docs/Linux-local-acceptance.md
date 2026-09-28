@@ -94,3 +94,9 @@ gh run list --workflow linux-local-acceptance.yml --branch arena/01a0e60c-nodela
 ```
 
 检查具体 run 的 commit、结论和所有三个 gate 的 JSON，不以 artifact 存在或 preparation 成功替代验收。即使全部通过，也仍仅限本机 fixture 范围，`real_node_test_allowed` 必须为 false。静态 YAML/测试检查不属于 GitHub runner 执行证据。
+
+### 最近一次远端运行：基础设施阻塞
+
+PR #2 的标签入口已经实际触发：[run 36399985871](https://github.com/wpuu/NodeLab/actions/runs/36399985871)，head `5f7f80871273592a8f92b934f42bf68ad94be587`。GitHub 因账户付款失败或支出额度限制阻止 job 启动；`steps=[]`、artifact 数量为 0。没有执行任何 gate，此 failure 不是测试失败，也不是验收通过。
+
+已暂时移除 `run-local-acceptance` 标签。账户维护者需先检查 GitHub 的 Billing & plans / Actions 支付与额度，之后再添加标签以验证最新 revision；不要通过修改 gate 或反复 rerun 绕过基础设施阻塞。详见审计 020。无需提供任何账单信息或凭据给本工具。
