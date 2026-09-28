@@ -58,11 +58,11 @@ tools/runtime/acceptance/bin/python scripts/f2_session_gate.py \
 - `session`：精确 11 个用例通过且零 skip；合成会话范围，不是实际代理协议证明。
 - `trojan-tcp`：精确 4 个用例通过且零 skip；实际本机 Trojan/TLS/TCP。
 - `vless-tcp`：精确 4 个用例通过且零 skip；实际本机 VLESS v0/零 addons/TLS/TCP。
-- `full`：当前精确 737 个 testcase，要求 734 passed，只允许三个指定 Windows 测试以 pytest.skip 跳过；不是任意三个 skip。失败诊断仅发布源码白名单中的测试函数标识，不包含参数或异常文本。增减测试时须审阅并更新 `FULL_EXPECTED_CASES`。
+- `full`：当前精确 768 个 testcase，要求 765 passed，只允许三个指定 Windows 测试以 pytest.skip 跳过；不是任意三个 skip。失败诊断仅发布源码白名单中的测试函数标识，不包含参数或异常文本。增减测试时须审阅并更新 `FULL_EXPECTED_CASES`。
 - 所有 gate 都要求固定二进制校验；不会接受环境变量提供的自定义摘要作为验收替代。
 - 即使协议 gate 通过，范围也仅为 `LOCAL_FIXTURE_ONLY`；不覆盖外部节点、Vision/WS/gRPC/Reality、Windows 或普通短请求的采样可靠性。
 
-最新远端执行状态见审计 026：完整 Linux 回归为 734 passed、3 个指定 Windows skip；三套独立 gate 为 11/4/4 个通过且零 skip。当前沙箱本身仍缺少受支持 Python 和可用官方二进制；不要混淆本地与远端结果。
+最新远端执行状态见审计 027：完整 Linux 回归为 765 passed、3 个指定 Windows skip；三套独立 gate 为 11/4/4 个通过且零 skip。当前沙箱本身仍缺少受支持 Python 和可用官方二进制；不要混淆本地与远端结果。
 
 ## 4. 可选：显式启用 GitHub Actions 验收
 
@@ -141,3 +141,9 @@ PR #2 的标签入口已经实际触发：[run 36399985871](https://github.com/w
 审计 026 将 checkout / setup-python / upload-artifact 更新为已按固定 SHA 核对 `runs.using=node24` 的官方版本，保留只读权限和显式启用策略。报告明确 ZIP 打包，排除隐藏文件；测试总数仍为 737。
 
 [run 36411287183](https://github.com/wpuu/NodeLab/actions/runs/36411287183)，head `1589b4a9123763ab440019a9ca20bfc9ca55e9af`：完整回归 **734 passed、3 个指定 Windows skip**，独立 gate 11/4/4 全过且零 skip。check `108891838127` 仅有五条结果 notice，无此前的 Node 20 弃用注释；报告上传步骤和 artifact 元数据均已核对。
+
+### Linux 恢复的 pidfd 要求
+
+审计 027 取消恢复路径的数字 PID 信号 fallback。Linux 自动恢复终止现在需要 `os.pidfd_open`、`signal.pidfd_send_signal`、可用内核权限和完整匹配身份；不可核实时返回失败，不把读取 /proc 失败当成进程消失。旧内核/API 或权限受限环境不再尝试较弱的终止方式。正常持有 Popen 的清理路径不受此能力要求影响。
+
+[run 36413400189](https://github.com/wpuu/NodeLab/actions/runs/36413400189)，head `0ce612017f20141a010a33054d91d949ac494e0e`：完整回归 **765 passed、3 个指定 Windows skip**，三套独立 gate 11/4/4 全过且零 skip；check `108898701420` 的固定 annotations 已核对。新增 31 项后 full 总数为 768，生产门禁仍关闭。
