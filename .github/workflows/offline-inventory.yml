@@ -7,6 +7,10 @@ name: Offline inventory synthetic acceptance
       - 'src/**'
       - 'tests/**'
       - 'scripts/inventory_demo.py'
+      - 'scripts/nodelab_offline.pyw'
+      - 'scripts/NodeLab_Offline.cmd'
+      - 'scripts/build_offline_bundle.py'
+      - 'docs/NodeLab_Offline_Readme.txt'
       - 'pyproject.toml'
       - '.github/workflows/offline-inventory.yml'
 
@@ -34,11 +38,30 @@ jobs:
         with:
           python-version: '3.12'
       - name: Install project and test dependencies
-        run: python -m pip install --disable-pip-version-check -e . pytest
+        run: python -m pip install --disable-pip-version-check -e . pytest idna==3.20
       - name: Inventory and parser acceptance with fictional inputs
-        run: python -m pytest -q tests/test_inventory.py tests/test_inventory_cli.py tests/test_strict_parser.py tests/test_trojan_parser.py tests/test_vless_parser.py tests/test_redaction.py --junitxml=offline-acceptance.xml
+        run: python -m pytest --override-ini addopts='' -q tests/test_inventory.py tests/test_inventory_cli.py tests/test_strict_parser.py tests/test_trojan_parser.py tests/test_vless_parser.py tests/test_redaction.py tests/test_offline_file.py tests/test_offline_bundle.py tests/test_offline_gui.py --junitxml=offline-acceptance.xml
       - name: Linux main regression (no real nodes or engine download)
         if: runner.os == 'Linux'
-        run: python -m pytest -q --junitxml=offline-regression.xml
+        run: python -m pytest --override-ini addopts='' -q --junitxml=offline-regression.xml
       - name: Generate safe synthetic sample and evidence
         run: python scripts/inventory_demo.py --output-dir generated-examples --emit-evidence
+      - name: Check Windows Tk runtime
+        if: runner.os == 'Windows'
+        run: python -c "import tkinter; window=tkinter.Tk(); window.withdraw(); window.update(); window.destroy(); print('WINDOWS_TK_RUNTIME_PASS')"
+      - name: Build minimal entry bundle
+        if: runner.os == 'Windows'
+        run: python scripts/build_offline_bundle.py --output-dir generated-bundle
+      - name: Upload fictional acceptance evidence and entry bundle
+        if: runner.os == 'Windows'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # verified v4 tag, 2026-10-05
+        with:
+          name: nodelab-offline-entry
+          path: |
+            generated-bundle/*
+            offline-acceptance.xml
+          if-no-files-found: error
+          retention-days: 14
+      - name: Emit bundle transfer bytes (code only, no owner input)
+        if: runner.os == 'Windows'
+        run: python -c "import base64,pathlib; print('NODELAB_OFFLINE_BUNDLE_BASE64=' + base64.b64encode(pathlib.Path('generated-bundle/NodeLab_Offline_V1.zip').read_bytes()).decode('ascii'))"
