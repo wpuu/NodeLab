@@ -10,7 +10,9 @@ from pathlib import Path
 
 # Supports the repository and a minimal bundle without installing NodeLab.
 _here = Path(__file__).absolute().parent
-if (_here.parent / "src" / "nodelab").is_dir():
+if (_here / "nodelab").is_dir():
+    sys.path.insert(0, str(_here))
+elif (_here.parent / "src" / "nodelab").is_dir():
     sys.path.insert(0, str(_here.parent / "src"))
 else:
     sys.path.insert(0, str(_here))

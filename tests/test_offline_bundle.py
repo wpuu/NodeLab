@@ -22,6 +22,10 @@ def test_extracted_bundle_is_complete_and_runs_without_site_packages(tmp_path):
         assert all(name.startswith("NodeLab_Offline_V1/") and ".." not in name.split("/") for name in names)
         archive.extractall(tmp_path / "unpacked")
     folder = tmp_path / "unpacked/NodeLab_Offline_V1"
+    # An adjacent old checkout must never replace the bundled parser.
+    adjacent = folder.parent / "src/nodelab"
+    adjacent.mkdir(parents=True)
+    (adjacent / "__init__.py").write_text("raise RuntimeError('OLD_CHECKOUT_IMPORTED')\n", encoding="utf-8")
     manifest = json.loads((folder / "MANIFEST.json").read_text(encoding="utf-8"))
     assert manifest["dependency"]["version"] == "3.20"
     assert manifest["input_included"] is False
@@ -45,4 +49,3 @@ def test_extracted_bundle_is_complete_and_runs_without_site_packages(tmp_path):
     assert json.loads(process.stdout)["self_check"] == "PASS"
     assert process.stderr == ""
     assert archive_path.with_suffix(".zip.sha256").read_text(encoding="ascii").split()[0] == hashlib.sha256(archive_path.read_bytes()).hexdigest()
-

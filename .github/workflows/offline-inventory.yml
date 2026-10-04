@@ -43,7 +43,7 @@ jobs:
         run: python -m pytest --override-ini addopts='' -q tests/test_inventory.py tests/test_inventory_cli.py tests/test_strict_parser.py tests/test_trojan_parser.py tests/test_vless_parser.py tests/test_redaction.py tests/test_offline_file.py tests/test_offline_bundle.py tests/test_offline_gui.py --junitxml=offline-acceptance.xml
       - name: Linux main regression (no real nodes or engine download)
         if: runner.os == 'Linux'
-        run: python -m pytest -q --junitxml=offline-regression.xml
+        run: python -m pytest --override-ini addopts='' -q --junitxml=offline-regression.xml
       - name: Generate safe synthetic sample and evidence
         run: python scripts/inventory_demo.py --output-dir generated-examples --emit-evidence
       - name: Check Windows Tk runtime
@@ -62,3 +62,6 @@ jobs:
             offline-acceptance.xml
           if-no-files-found: error
           retention-days: 14
+      - name: Emit bundle transfer bytes (code only, no owner input)
+        if: runner.os == 'Windows'
+        run: python -c "import base64,pathlib; print('NODELAB_OFFLINE_BUNDLE_BASE64=' + base64.b64encode(pathlib.Path('generated-bundle/NodeLab_Offline_V1.zip').read_bytes()).decode('ascii'))"
