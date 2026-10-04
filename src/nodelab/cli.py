@@ -8,6 +8,10 @@ import sys
 from pathlib import Path
 from typing import Any
 
+from nodelab.inventory import (
+    InventoryInputError, MAX_INPUT_BYTES, build_inventory,
+    render_inventory_report, validate_inventory,
+)
 from nodelab.mihomo_config import PrivateRunError, recover_stale_runs
 from nodelab.parser import parse_uris
 from nodelab.redaction import redacted_result_dict
@@ -76,6 +80,52 @@ def _cmd_parse_stdin(args: argparse.Namespace) -> int:
     return 0
 
 
+def _inventory_failure(code: str) -> int:
+    print(json.dumps({
+        "schema_version": 1, "mode": "offline_inventory", "complete": False,
+        "network_used": False, "error_code": InventoryInputError(code).code,
+    }, separators=(",", ":")))
+    return 2
+
+
+def _emit_inventory(data: bytes, output_format: str) -> int:
+    try:
+        report = build_inventory(data)
+        validate_inventory(report)
+        output = render_inventory_report(report) if output_format == "markdown" else json.dumps(report, ensure_ascii=False, separators=(",", ":"))
+    except InventoryInputError as exc:
+        return _inventory_failure(exc.code)
+    except Exception:
+        # Unexpected parser/library errors must not echo private input.
+        return _inventory_failure("INVENTORY_FAILED")
+    print(output, end="" if output.endswith("\n") else "\n")
+    return 0
+
+
+def _cmd_inventory_file(args: argparse.Namespace) -> int:
+    try:
+        path = Path(args.file)
+        if not path.is_absolute() or path.is_symlink() or not path.is_file():
+            return _inventory_failure("INPUT_FILE_UNSAFE")
+        if path.stat().st_size > MAX_INPUT_BYTES:
+            return _inventory_failure("INPUT_TOO_LARGE")
+        with path.open("rb") as handle:
+            data = handle.read(MAX_INPUT_BYTES + 1)
+    except (OSError, ValueError):
+        return _inventory_failure("INPUT_FILE_UNSAFE")
+    return _emit_inventory(data, args.format)
+
+
+def _cmd_inventory_stdin(args: argparse.Namespace) -> int:
+    if sys.stdin.isatty():
+        return _inventory_failure("INPUT_FILE_UNSAFE")
+    try:
+        data = sys.stdin.buffer.read(MAX_INPUT_BYTES + 1)
+    except (OSError, ValueError, AttributeError):
+        return _inventory_failure("INPUT_FILE_UNSAFE")
+    return _emit_inventory(data, args.format)
+
+
 def _cmd_recover(args: argparse.Namespace) -> int:
     """Explicit crash recovery of the private root; never a global process sweep."""
     if not args.confirm:
@@ -107,6 +157,11 @@ def main(argv: list[str] | None = None) -> int:
     p_pf.add_argument("--limit", type=int, default=1)
     p_ps = sub.add_parser("parse-stdin", help="Read input from a protected-file pipe")
     p_ps.add_argument("--limit", type=int, default=1)
+    p_if = sub.add_parser("inventory-file", help="Inventory all bounded offline input; no live-node verdicts")
+    p_if.add_argument("--file", required=True)
+    p_if.add_argument("--format", choices=("json", "markdown"), default="json")
+    p_is = sub.add_parser("inventory-stdin", help="Inventory a protected-file pipe without probing")
+    p_is.add_argument("--format", choices=("json", "markdown"), default="json")
     p_probe = sub.add_parser("probe-file", help="Reserved until route-proof and Windows gates")
     p_probe.add_argument("--file", required=True)
     p_probe.add_argument("--limit", type=int, default=1)
@@ -125,6 +180,10 @@ def main(argv: list[str] | None = None) -> int:
         return _cmd_parse_file(args)
     if args.command == "parse-stdin":
         return _cmd_parse_stdin(args)
+    if args.command == "inventory-file":
+        return _cmd_inventory_file(args)
+    if args.command == "inventory-stdin":
+        return _cmd_inventory_stdin(args)
     if args.command == "recover":
         return _cmd_recover(args)
     if args.command in {"probe-file", "probe-stdin"}:
