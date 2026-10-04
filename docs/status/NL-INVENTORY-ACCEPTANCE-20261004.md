@@ -17,7 +17,7 @@ main = 55ce1b248e1bb5b2368ae34b4fcfbb34f9057a3f。
 - Windows 2022：同组虚构盘点/CLI/解析/脱敏测试步骤 success；Linux main 回归步骤按工作流条件 skipped。
 - 两边示例生成步骤 success；从各自日志取回 base64 编码的 JSON、Markdown，解码并逐字比较，内容一致。
 - pytest 输出使用安静选项，未取得清晰汇总计数，不编造通过项数量。整体 success 不等于用户本机安全验收。
-- 本轮本地终端不可连接，未本地运行 Python；上述执行证据来自 GitHub 云运行器。
+- 本轮首个本地终端调用连接失败，随后重试的 Get-Location 成功返回；未本地运行 Python 或测试，上述执行证据来自 GitHub 云运行器。
 
 ## 实际示例
 14 物理行，2 空白，12 非空记录；7 解析、3 不支持、2 错误；5 规范化配置组、2 重复记录。
