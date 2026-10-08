@@ -1,0 +1,66 @@
+{
+  "schema_version": 1,
+  "synthetic_only": true,
+  "window_start": "2030-01-01T00:00:00Z",
+  "window_end": "2030-02-01T00:00:00Z",
+  "reserve_ratio": "0.20",
+  "free": {
+    "people": 10,
+    "per_person": {
+      "amount": 2,
+      "unit": "GB"
+    }
+  },
+  "advanced": {
+    "people": 2,
+    "per_person": {
+      "amount": 10,
+      "unit": "GiB"
+    }
+  },
+  "groups": [
+    {
+      "id": "G0001",
+      "quota": {
+        "amount": 100,
+        "unit": "GiB"
+      },
+      "used": {
+        "amount": 10,
+        "unit": "GB"
+      },
+      "quota_evidence": "E0001",
+      "verified": "verified",
+      "window_start": "2030-01-01T00:00:00Z",
+      "window_end": "2030-02-01T00:00:00Z",
+      "cost": "25",
+      "currency": "CNY",
+      "cost_complete": false,
+      "service_hours": null
+    }
+  ],
+  "resources": [
+    {
+      "id": "R0001",
+      "group": "G0001",
+      "source": "owned",
+      "source_evidence": "E0002",
+      "use_authorization": "allowed",
+      "supply_authorization": "allowed",
+      "authorization_evidence": "E0003",
+      "expires_at": "2030-02-01T00:00:00Z",
+      "verified": "verified"
+    },
+    {
+      "id": "R0002",
+      "group": null,
+      "source": "third_party_shared",
+      "source_evidence": "E0004",
+      "use_authorization": "allowed",
+      "supply_authorization": "unknown",
+      "authorization_evidence": null,
+      "expires_at": null,
+      "verified": "unknown"
+    }
+  ]
+}
