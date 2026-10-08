@@ -9,6 +9,8 @@ from nodelab.parser import parse_uris
 from nodelab.types import NodeURIParseError, ParsedNode
 
 MAX_INPUT_BYTES = 512 * 1024
+# Fixed public rows still amplify small input; cap records before parsing.
+MAX_INPUT_RECORDS = 1000
 _PROTOCOLS = frozenset({
     "vless", "trojan", "vmess", "ss", "ssr", "hysteria", "hysteria2", "tuic",
     "http", "https", "socks", "socks5", "other",
@@ -18,7 +20,7 @@ _DIALECTS = frozenset({
     "unsupported_httpupgrade", "unclassified",
 })
 _INPUT_CODES = frozenset({
-    "INPUT_TOO_LARGE", "INVALID_UTF8", "INPUT_TYPE_INVALID", "INPUT_FILE_UNSAFE",
+    "INPUT_TOO_LARGE", "INPUT_TOO_MANY_RECORDS", "INVALID_UTF8", "INPUT_TYPE_INVALID", "INPUT_FILE_UNSAFE",
     "PUBLIC_SCHEMA_REJECTED", "INVALID_ARGUMENTS", "INVENTORY_FAILED",
 })
 _ROW_KEYS = frozenset({
@@ -107,7 +109,13 @@ def build_inventory(data: bytes | str) -> dict[str, Any]:
     if len(data) > MAX_INPUT_BYTES:
         raise InventoryInputError("INPUT_TOO_LARGE")
     physical = _physical_lines(data)
-    batch = parse_uris(data)  # No legacy default limit of one or 100 records.
+    records = 0
+    for raw in physical:
+        if raw.strip():
+            records += 1
+            if records > MAX_INPUT_RECORDS:
+                raise InventoryInputError("INPUT_TOO_MANY_RECORDS")
+    batch = parse_uris(data)  # Entire accepted input; never truncate records.
     groups: dict[tuple[Any, ...], tuple[str, str]] = {}
     rows: list[dict[str, Any]] = []
     for line in batch.lines:
@@ -162,6 +170,8 @@ def validate_inventory(report: Any) -> None:
     if type(summary) is not dict or set(summary) != _SUMMARY_KEYS or type(rows) is not list:
         reject()
     if any(type(v) is not int or not 0 <= v <= MAX_INPUT_BYTES for v in summary.values()):
+        reject()
+    if len(rows) > MAX_INPUT_RECORDS:
         reject()
     first: dict[str, str] = {}
     last_line = 0

@@ -11,7 +11,7 @@ from pathlib import Path
 
 from nodelab.inventory import MAX_INPUT_BYTES, InventoryInputError, build_inventory, render_inventory_report
 
-_CODES = frozenset({"INPUT_UNSAFE", "INPUT_TOO_LARGE", "OUTPUT_UNSAFE", "OUTPUT_FAILED", "INVENTORY_FAILED"})
+_CODES = frozenset({"INPUT_UNSAFE", "INPUT_TOO_LARGE", "INPUT_TOO_MANY_RECORDS", "OUTPUT_UNSAFE", "OUTPUT_FAILED", "INVENTORY_FAILED"})
 
 
 class OfflineFileError(ValueError):
@@ -78,8 +78,9 @@ def inspect_file(source: Path) -> dict:
         return build_inventory(data)
     except OfflineFileError:
         raise
-    except InventoryInputError:
-        raise OfflineFileError("INVENTORY_FAILED") from None
+    except InventoryInputError as exc:
+        code = exc.code if exc.code in {"INPUT_TOO_LARGE", "INPUT_TOO_MANY_RECORDS"} else "INVENTORY_FAILED"
+        raise OfflineFileError(code) from None
     except (OSError, ValueError):
         raise OfflineFileError("INPUT_UNSAFE") from None
     except Exception:

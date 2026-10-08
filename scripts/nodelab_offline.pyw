@@ -53,7 +53,7 @@ def _gui() -> int:
     frame = ttk.Frame(root, padding=18)
     frame.pack(fill="both", expand=True)
     ttk.Label(frame, text="选择一份本机节点文本，生成匿名统计", font=("", 14)).pack(anchor="w")
-    ttk.Label(frame, text="支持逐行文本，最多512KiB。仅盘点，不连接节点或上传资料。", wraplength=530).pack(anchor="w", pady=(10, 6))
+    ttk.Label(frame, text="支持UTF-8逐行文本，最多512KiB、1000条非空记录。仅盘点，不联网。", wraplength=530).pack(anchor="w", pady=(10, 6))
     ttk.Label(frame, text="请选择已下载的本地文件；网络盘、重解析点和云占位文件会被拒绝。", wraplength=530).pack(anchor="w")
     output = tk.Text(frame, height=12, wrap="word", state="disabled")
     output.pack(fill="both", expand=True, pady=12)
@@ -104,7 +104,8 @@ def _gui() -> int:
             copy_button.config(state="normal")
         else:
             state["summary"] = ""
-            display("盘点未完成。错误码：" + text + "\n原始文件没有被修改。")
+            hint = "\n非空记录超过1000条；本次整份拒绝，未生成报告。" if text == "INPUT_TOO_MANY_RECORDS" else ""
+            display("盘点未完成。错误码：" + text + hint + "\n原始文件没有被修改。")
         root.after(100, poll)
 
     def copy():
