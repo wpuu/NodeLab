@@ -1,6 +1,7 @@
 """Read and compare saved anonymous reports, without revisiting the input."""
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -70,13 +71,14 @@ def _open_checked(path: Path, limit: int, observed: dict):
         _check_local_path(path)
         if _identity(os.fstat(fd)) != _identity(opened) or _identity(path.lstat()) != _identity(before):
             raise OfflineReportError("REPORT_UNSAFE")
-        observed[path] = _identity(before)
+        observed[path] = {"path_identity": _identity(before), "handle_identity": _identity(opened), "limit": limit}
     finally:
         os.close(fd)
 
 
 def _read_file(path: Path, limit: int, observed: dict) -> bytes:
     chunks, total = [], 0
+    digest = hashlib.sha256()
     with _open_checked(path, limit, observed) as fd:
         while True:
             chunk = os.read(fd, min(_CHUNK_BYTES, limit + 1 - total))
@@ -86,7 +88,32 @@ def _read_file(path: Path, limit: int, observed: dict) -> bytes:
             if total > limit:
                 raise OfflineReportError("REPORT_TOO_LARGE")
             chunks.append(chunk)
+            digest.update(chunk)
+    observed[path]["digest"] = digest.digest()
     return b"".join(chunks)
+
+
+def _recheck_file(path: Path, snapshot: dict) -> None:
+    # Metadata can stay unchanged during a same-length write, especially on
+    # Windows. Re-read each bounded report component before returning, without
+    # exporting its internal byte fingerprint or revisiting the original input.
+    _check_local_path(path)
+    if _identity(path.lstat()) != snapshot["path_identity"]:
+        raise OfflineReportError("REPORT_UNSAFE")
+    digest, total = hashlib.sha256(), 0
+    with _open_checked(path, snapshot["limit"], {}) as fd:
+        if _identity(os.fstat(fd)) != snapshot["handle_identity"]:
+            raise OfflineReportError("REPORT_UNSAFE")
+        while True:
+            chunk = os.read(fd, min(_CHUNK_BYTES, snapshot["limit"] + 1 - total))
+            if not chunk:
+                break
+            total += len(chunk)
+            if total > snapshot["limit"]:
+                raise OfflineReportError("REPORT_UNSAFE")
+            digest.update(chunk)
+        if digest.digest() != snapshot["digest"]:
+            raise OfflineReportError("REPORT_UNSAFE")
 
 
 def _object(pairs):
@@ -191,6 +218,7 @@ def _compare_markdown(path: Path, expected: str, observed: dict) -> None:
             position = end
         if position != len(data):
             raise OfflineReportError("REPORT_MISMATCH")
+    observed[path]["digest"] = hashlib.sha256(data).digest()
 
 
 def load_reports(folder: Path) -> dict:
@@ -216,10 +244,8 @@ def load_reports(folder: Path) -> dict:
             lines = markdown.split("\n")
             expected = "\n".join(lines[:4] + lines[8:])
         _compare_markdown(folder / "inventory.md", expected, observed)
-        for path, identity in observed.items():
-            _check_local_path(path)
-            if _identity(path.lstat()) != identity:
-                raise OfflineReportError("REPORT_UNSAFE")
+        for path, snapshot in observed.items():
+            _recheck_file(path, snapshot)
         _check_local_path(folder)
         after = folder.lstat()
         if not stat.S_ISDIR(after.st_mode) or _identity(before) != _identity(after):

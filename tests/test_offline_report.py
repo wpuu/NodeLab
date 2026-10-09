@@ -566,7 +566,7 @@ def _simulate_windows_stat_channels(monkeypatch, folder, *, opened_change=None, 
     real_os, real_lstat = offline_report.os, Path.lstat
     targets = {folder, *(folder / filename for filename in FILES)}
     snapshots = {path: real_lstat(path) for path in targets}
-    fd_paths, fd_calls, reads, closes = {}, {}, [], []
+    fd_paths, fd_calls, reads, closes, opens = {}, {}, [], [], []
 
     def metadata(current):
         values = {key: getattr(current, key) for key in dir(current) if key.startswith("st_")}
@@ -593,6 +593,7 @@ def _simulate_windows_stat_channels(monkeypatch, folder, *, opened_change=None, 
         def open(self, path, *args, **kwargs):
             fd = real_os.open(path, *args, **kwargs)
             fd_paths[fd], fd_calls[fd] = Path(path), 0
+            opens.append(Path(path).name)
             return fd
 
         def fstat(self, fd):
@@ -614,7 +615,7 @@ def _simulate_windows_stat_channels(monkeypatch, folder, *, opened_change=None, 
 
     monkeypatch.setattr(Path, "lstat", channel_lstat)
     monkeypatch.setattr(offline_report, "os", PerModuleOS())
-    return reads, closes
+    return reads, closes, opens
 
 
 @pytest.mark.parametrize("input_format", ["legacy_v1", "uri_lines", "base64", "not_recorded"])
@@ -622,11 +623,12 @@ def test_windows_birthtime_accepts_unchanged_report_with_different_ctime_api_sem
     folder = _legacy(tmp_path) if input_format == "legacy_v1" else _folder(tmp_path, input_format)
     expected = _json(folder / "inventory.json")
     real_name = os.name
-    reads, closes = _simulate_windows_stat_channels(monkeypatch, folder)
+    reads, closes, opens = _simulate_windows_stat_channels(monkeypatch, folder)
     result = load_reports(folder)
     assert result["report"] == expected
     assert result["metadata"] == EXPECTED_METADATA["not_recorded" if input_format == "legacy_v1" else input_format]
-    assert reads and len(closes) == 3
+    assert reads and len(closes) == len(opens)
+    assert all(opens.count(filename) == 2 for filename in FILES)
     assert os.name == real_name
     # The regression fixture did not switch pathlib to an unsupported platform.
     assert type(folder) is type(Path.cwd())
@@ -641,7 +643,7 @@ def test_windows_cross_channel_identity_difference_is_rejected_before_read(tmp_p
         # be caught by identity comparison rather than the placeholder mask.
         values[field] += 0x20 if field == "st_file_attributes" else 1
 
-    reads, closes = _simulate_windows_stat_channels(monkeypatch, folder, opened_change=altered)
+    reads, closes, opens = _simulate_windows_stat_channels(monkeypatch, folder, opened_change=altered)
     _assert_error(folder, "REPORT_UNSAFE")
     assert reads == []
     assert len(closes) == 1
@@ -653,7 +655,7 @@ def test_windows_missing_explicit_birthtime_fails_closed_before_read(tmp_path, m
     def without_birthtime(values, calls):
         del values["st_birthtime_ns"]
 
-    reads, closes = _simulate_windows_stat_channels(monkeypatch, folder, opened_change=without_birthtime)
+    reads, closes, opens = _simulate_windows_stat_channels(monkeypatch, folder, opened_change=without_birthtime)
     _assert_error(folder, "REPORT_UNSAFE")
     assert reads == []
     assert len(closes) == 1
@@ -666,7 +668,7 @@ def test_windows_handle_ctime_change_still_rejected_with_unchanged_birthtime(tmp
         if calls > 1:
             values["st_ctime_ns"] += 1
 
-    reads, closes = _simulate_windows_stat_channels(monkeypatch, folder, opened_change=changed_after_read)
+    reads, closes, opens = _simulate_windows_stat_channels(monkeypatch, folder, opened_change=changed_after_read)
     _assert_error(folder, "REPORT_UNSAFE")
     assert reads and len(closes) == 1
 
@@ -678,14 +680,14 @@ def test_windows_path_ctime_change_still_rejected_with_unchanged_birthtime(tmp_p
         if was_read:
             values["st_ctime_ns"] += 1
 
-    reads, closes = _simulate_windows_stat_channels(monkeypatch, folder, path_change=changed_after_read)
+    reads, closes, opens = _simulate_windows_stat_channels(monkeypatch, folder, path_change=changed_after_read)
     _assert_error(folder, "REPORT_UNSAFE")
     assert reads and len(closes) == 1
 
 
 def test_posix_ctime_identity_remains_required_before_read(tmp_path, monkeypatch):
     folder = _folder(tmp_path)
-    reads, closes = _simulate_windows_stat_channels(monkeypatch, folder, name="posix")
+    reads, closes, opens = _simulate_windows_stat_channels(monkeypatch, folder, name="posix")
     _assert_error(folder, "REPORT_UNSAFE")
     assert reads == []
     assert len(closes) == 1
@@ -708,3 +710,88 @@ def test_windows_native_stat_channels_preserve_explicit_birthtime_identity(tmp_p
     assert birthtime_available and fields_match
     assert path_info.st_birthtime_ns == handle_info.st_birthtime_ns
     assert load_reports(folder)["report"]["summary"]["records"] == 2
+
+
+@pytest.mark.parametrize("filename", ["COMPLETE.json", "inventory.json", "inventory.md"])
+def test_prior_report_bytes_change_is_rejected_even_when_all_metadata_is_unchanged(tmp_path, monkeypatch, capsys, filename):
+    """A second bounded content read must detect changes invisible to stat.
+
+    This deliberately freezes both metadata APIs, so neither timestamps nor
+    inode/size checks can make the test pass. The target JSON was already
+    parsed before Markdown reading starts and is modified without any delay.
+    """
+    import hashlib
+
+    folder = _folder(tmp_path)
+    target = folder / filename
+    original_bytes = target.read_bytes()
+    if filename == "COMPLETE.json":
+        stamp = _json(target)["created_at_utc"]
+        other_stamp = ("2025" if not stamp.startswith("2025") else "2024") + stamp[4:]
+        modified_bytes = original_bytes.replace(stamp.encode("ascii"), other_stamp.encode("ascii"))
+    elif filename == "inventory.json":
+        modified_bytes = original_bytes.replace(b'"physical_lines": 3', b'"physical_lines": 4')
+        modified_bytes = modified_bytes.replace(b'"blank_lines": 1', b'"blank_lines": 2')
+    else:
+        modified_bytes = original_bytes.replace("| 非空记录 | 2 |".encode("utf-8"),
+                                                "| 非空记录 | 3 |".encode("utf-8"))
+    assert modified_bytes != original_bytes and len(modified_bytes) == len(original_bytes)
+    original_path_stat = Path.lstat
+    real_os = offline_report.os
+    components = {folder / component for component in FILES}
+    path_snapshots = {path: original_path_stat(path) for path in components | {folder}}
+    handle_snapshots = {}
+    for path in components:
+        with path.open("rb") as handle:
+            handle_snapshots[path] = real_os.fstat(handle.fileno())
+    opened_names, reads_after_change, fd_paths, changes = [], [], {}, []
+
+    def frozen_lstat(self, *args, **kwargs):
+        if self in path_snapshots:
+            return path_snapshots[self]
+        return original_path_stat(self, *args, **kwargs)
+
+    class FrozenMetadataOS:
+        def __getattr__(self, name):
+            return getattr(real_os, name)
+
+        def open(self, path, *args, **kwargs):
+            fd = real_os.open(path, *args, **kwargs)
+            fd_paths[fd] = Path(path)
+            opened_names.append(Path(path).name)
+            return fd
+
+        def fstat(self, fd):
+            return handle_snapshots[fd_paths[fd]]
+
+        def read(self, fd, count):
+            component = fd_paths[fd]
+            # Marker/JSON change while Markdown is first read. Markdown itself
+            # changes only after its comparison, during the marker readback.
+            trigger = (component.name == "inventory.md" if filename != "inventory.md" else
+                       component.name == "COMPLETE.json" and opened_names.count("COMPLETE.json") == 2)
+            if trigger and not changes:
+                target.write_bytes(modified_bytes)
+                prior = path_snapshots[target]
+                real_os.utime(target, ns=(prior.st_atime_ns, prior.st_mtime_ns))
+                changes.append(True)
+            if changes and component == target:
+                reads_after_change.append(count)
+            return real_os.read(fd, count)
+
+        def close(self, fd):
+            real_os.close(fd)
+
+    monkeypatch.setattr(Path, "lstat", frozen_lstat)
+    monkeypatch.setattr(offline_report, "os", FrozenMetadataOS())
+    error = _assert_error(folder, "REPORT_UNSAFE", capsys)
+    assert changes == [True]
+    assert opened_names.count(filename) == 2
+    assert reads_after_change, "changed bytes were never reread after metadata checks"
+    assert all(0 < count <= 64 * 1024 for count in reads_after_change)
+    assert target.read_bytes() == modified_bytes
+    assert target.stat().st_mtime_ns == path_snapshots[target].st_mtime_ns
+    public = str(error) + repr(error) + repr(error.args)
+    assert hashlib.sha256(original_bytes).hexdigest() not in public
+    assert hashlib.sha256(modified_bytes).hexdigest() not in public
+    _safe_text(public, folder)
