@@ -54,6 +54,16 @@ jobs:
         run: python -m pytest --override-ini addopts='' -q --junitxml=offline-regression.xml
       - name: Generate safe synthetic sample and evidence
         run: python scripts/inventory_demo.py --output-dir generated-examples --emit-evidence
+      - name: Upload Linux fictional acceptance and regression results
+        if: runner.os == 'Linux'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: nodelab-linux-fictional-acceptance
+          path: |
+            offline-acceptance.xml
+            offline-regression.xml
+          if-no-files-found: error
+          retention-days: 14
       - name: Check Windows Tk runtime
         if: runner.os == 'Windows'
         run: python -c "import tkinter; window=tkinter.Tk(); window.withdraw(); window.update(); window.destroy(); print('WINDOWS_TK_RUNTIME_PASS')"

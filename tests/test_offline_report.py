@@ -554,3 +554,157 @@ print(json.dumps({"records": result["report"]["summary"]["records"], "engine_imp
     assert completed.stderr == ""
     assert json.loads(completed.stdout) == {"records": 2, "engine_imports": [], "network_used": False}
     _safe_text(completed.stdout + completed.stderr, folder)
+
+
+def _simulate_windows_stat_channels(monkeypatch, folder, *, opened_change=None, path_change=None, name="nt"):
+    """Fake only metadata channels, keeping real paths, descriptors and bytes.
+
+    CPython Windows path stat may report creation time in ctime while fstat
+    reports ChangeTime. Both APIs still expose the same explicit birthtime.
+    Replacing this module's os object leaves pathlib/global os.name intact.
+    """
+    real_os, real_lstat = offline_report.os, Path.lstat
+    targets = {folder, *(folder / filename for filename in FILES)}
+    snapshots = {path: real_lstat(path) for path in targets}
+    fd_paths, fd_calls, reads, closes = {}, {}, [], []
+
+    def metadata(current):
+        values = {key: getattr(current, key) for key in dir(current) if key.startswith("st_")}
+        values["st_birthtime_ns"] = getattr(current, "st_birthtime_ns", current.st_ctime_ns)
+        values["st_file_attributes"] = getattr(current, "st_file_attributes", 0)
+        return values
+
+    def channel_lstat(self, *args, **kwargs):
+        if self not in snapshots:
+            return real_lstat(self, *args, **kwargs)
+        values = metadata(snapshots[self])
+        values["st_ctime_ns"] = values["st_birthtime_ns"]
+        if path_change is not None:
+            path_change(values, bool(reads))
+        return SimpleNamespace(**values)
+
+    class PerModuleOS:
+        def __init__(self):
+            self.name = name
+
+        def __getattr__(self, attribute):
+            return getattr(real_os, attribute)
+
+        def open(self, path, *args, **kwargs):
+            fd = real_os.open(path, *args, **kwargs)
+            fd_paths[fd], fd_calls[fd] = Path(path), 0
+            return fd
+
+        def fstat(self, fd):
+            values = metadata(real_os.fstat(fd))
+            values["st_birthtime_ns"] = metadata(snapshots[fd_paths[fd]])["st_birthtime_ns"]
+            values["st_ctime_ns"] = values["st_birthtime_ns"] + 1000
+            fd_calls[fd] += 1
+            if opened_change is not None:
+                opened_change(values, fd_calls[fd])
+            return SimpleNamespace(**values)
+
+        def read(self, fd, count):
+            reads.append((fd, count))
+            return real_os.read(fd, count)
+
+        def close(self, fd):
+            closes.append(fd)
+            real_os.close(fd)
+
+    monkeypatch.setattr(Path, "lstat", channel_lstat)
+    monkeypatch.setattr(offline_report, "os", PerModuleOS())
+    return reads, closes
+
+
+@pytest.mark.parametrize("input_format", ["legacy_v1", "uri_lines", "base64", "not_recorded"])
+def test_windows_birthtime_accepts_unchanged_report_with_different_ctime_api_semantics(tmp_path, monkeypatch, input_format):
+    folder = _legacy(tmp_path) if input_format == "legacy_v1" else _folder(tmp_path, input_format)
+    expected = _json(folder / "inventory.json")
+    real_name = os.name
+    reads, closes = _simulate_windows_stat_channels(monkeypatch, folder)
+    result = load_reports(folder)
+    assert result["report"] == expected
+    assert result["metadata"] == EXPECTED_METADATA["not_recorded" if input_format == "legacy_v1" else input_format]
+    assert reads and len(closes) == 3
+    assert os.name == real_name
+    # The regression fixture did not switch pathlib to an unsupported platform.
+    assert type(folder) is type(Path.cwd())
+
+
+@pytest.mark.parametrize("field", ["st_dev", "st_ino", "st_size", "st_mtime_ns", "st_birthtime_ns", "st_file_attributes"])
+def test_windows_cross_channel_identity_difference_is_rejected_before_read(tmp_path, monkeypatch, field):
+    folder = _folder(tmp_path)
+
+    def altered(values, calls):
+        # 0x20 is an ordinary file attribute, so the attribute mismatch must
+        # be caught by identity comparison rather than the placeholder mask.
+        values[field] += 0x20 if field == "st_file_attributes" else 1
+
+    reads, closes = _simulate_windows_stat_channels(monkeypatch, folder, opened_change=altered)
+    _assert_error(folder, "REPORT_UNSAFE")
+    assert reads == []
+    assert len(closes) == 1
+
+
+def test_windows_missing_explicit_birthtime_fails_closed_before_read(tmp_path, monkeypatch):
+    folder = _folder(tmp_path)
+
+    def without_birthtime(values, calls):
+        del values["st_birthtime_ns"]
+
+    reads, closes = _simulate_windows_stat_channels(monkeypatch, folder, opened_change=without_birthtime)
+    _assert_error(folder, "REPORT_UNSAFE")
+    assert reads == []
+    assert len(closes) == 1
+
+
+def test_windows_handle_ctime_change_still_rejected_with_unchanged_birthtime(tmp_path, monkeypatch):
+    folder = _folder(tmp_path)
+
+    def changed_after_read(values, calls):
+        if calls > 1:
+            values["st_ctime_ns"] += 1
+
+    reads, closes = _simulate_windows_stat_channels(monkeypatch, folder, opened_change=changed_after_read)
+    _assert_error(folder, "REPORT_UNSAFE")
+    assert reads and len(closes) == 1
+
+
+def test_windows_path_ctime_change_still_rejected_with_unchanged_birthtime(tmp_path, monkeypatch):
+    folder = _folder(tmp_path)
+
+    def changed_after_read(values, was_read):
+        if was_read:
+            values["st_ctime_ns"] += 1
+
+    reads, closes = _simulate_windows_stat_channels(monkeypatch, folder, path_change=changed_after_read)
+    _assert_error(folder, "REPORT_UNSAFE")
+    assert reads and len(closes) == 1
+
+
+def test_posix_ctime_identity_remains_required_before_read(tmp_path, monkeypatch):
+    folder = _folder(tmp_path)
+    reads, closes = _simulate_windows_stat_channels(monkeypatch, folder, name="posix")
+    _assert_error(folder, "REPORT_UNSAFE")
+    assert reads == []
+    assert len(closes) == 1
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Native Windows stat/fstat metadata evidence")
+def test_windows_native_stat_channels_preserve_explicit_birthtime_identity(tmp_path, record_property):
+    folder = _folder(tmp_path)
+    path = folder / "inventory.json"
+    path_info = path.lstat()
+    with path.open("rb") as handle:
+        handle_info = os.fstat(handle.fileno())
+    birthtime_available = hasattr(path_info, "st_birthtime_ns") and hasattr(handle_info, "st_birthtime_ns")
+    fields_match = all(getattr(path_info, field) == getattr(handle_info, field)
+                       for field in ("st_dev", "st_ino", "st_size", "st_mtime_ns", "st_file_attributes"))
+    record_property("identity_fields_match", fields_match)
+    record_property("ctime_api_matches", path_info.st_ctime_ns == handle_info.st_ctime_ns)
+    record_property("birthtime_available", birthtime_available)
+    record_property("birthtime_matches", birthtime_available and path_info.st_birthtime_ns == handle_info.st_birthtime_ns)
+    assert birthtime_available and fields_match
+    assert path_info.st_birthtime_ns == handle_info.st_birthtime_ns
+    assert load_reports(folder)["report"]["summary"]["records"] == 2

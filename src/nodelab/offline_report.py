@@ -35,7 +35,18 @@ class OfflineReportError(ValueError):
 
 def _identity(info) -> tuple:
     return (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns,
-            info.st_ctime_ns, getattr(info, "st_file_attributes", 0))
+            info.st_ctime_ns, getattr(info, "st_file_attributes", 0),
+            getattr(info, "st_birthtime_ns", None))
+
+
+def _cross_identity(info) -> tuple:
+    if os.name == "nt":
+        # CPython 3.12+ path stat keeps ctime as creation time, while fstat
+        # reports Windows ChangeTime (CPython #157671). Compare creation time
+        # explicitly across these APIs; retain full ctime within each API.
+        return (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns,
+                info.st_birthtime_ns, getattr(info, "st_file_attributes", 0))
+    return _identity(info)
 
 
 @contextmanager
@@ -52,12 +63,12 @@ def _open_checked(path: Path, limit: int, observed: dict):
     fd = os.open(path, flags)
     try:
         opened = os.fstat(fd)
-        if (not stat.S_ISREG(opened.st_mode) or _identity(opened) != _identity(before)
+        if (not stat.S_ISREG(opened.st_mode) or _cross_identity(opened) != _cross_identity(before)
                 or getattr(opened, "st_file_attributes", 0) & _ATTRIBUTES):
             raise OfflineReportError("REPORT_UNSAFE")
         yield fd
         _check_local_path(path)
-        if _identity(os.fstat(fd)) != _identity(before) or _identity(path.lstat()) != _identity(before):
+        if _identity(os.fstat(fd)) != _identity(opened) or _identity(path.lstat()) != _identity(before):
             raise OfflineReportError("REPORT_UNSAFE")
         observed[path] = _identity(before)
     finally:
