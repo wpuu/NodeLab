@@ -2,12 +2,12 @@
 
 更新：2026-10-09（北京时间）；执行助手：Codex，细分模型未独立核验。
 
-Windows x64 独立桌面候选已实际构建，内含Python3.13.16/Tcl/Tk8.6.15，用户无需预装Python。冻结程序在删除源码暂存、清空PATH后实际通过自检、虚构URI/Base64处理、三次报告往返、匿名错误、文件不改写、网络/DNS/子进程阻断及隐藏Tk窗口。生成ZIP成功后逐项文件哈希读回通过；下载产物再次核对999个文件、压缩包哈希与CRC。用户Windows电脑完整桌面验收仍未完成。
+Windows x64 独立桌面候选已实际构建，内含Python3.13.16/Tcl/Tk8.6.15，用户无需预装Python。冻结程序在删除源码暂存、清空PATH后实际通过自检、虚构URI/Base64处理、三次报告往返、匿名错误、文件不改写、网络/DNS/子进程阻断及隐藏Tk窗口。生成ZIP成功后逐项文件哈希读回通过；下载产物再次核对1002个文件、压缩包哈希与CRC。用户Windows电脑完整桌面验收仍未完成。
 
-实际代码提交：b361e7c8a836308c7ad9c172b28ac79e73b8d403。
+实际代码提交：79d1064b34eb9429fad070b2a72280bc454504bf。
 候选分支：feat/offline-inventory-standalone-20261009。
 草稿审查：https://github.com/wpuu/NodeLab/pull/6
-成功CI：https://github.com/wpuu/NodeLab/actions/runs/37912081842
+成功CI：https://github.com/wpuu/NodeLab/actions/runs/37913566382
 审查目标为既有离线入口分支；main未合并。
 
 | 实际验收 | 通过 | 跳过 | 失败 |
@@ -29,4 +29,4 @@ Windows x64 独立桌面候选已实际构建，内含Python3.13.16/Tcl/Tk8.6.15
 - [输入格式历史记录](NL-OFFLINE-INPUT-METADATA-20261009.txt)
 - [构建后Windows包说明](../NodeLab_Standalone_Readme.txt)
 
-产物许可补正：实际PE版本识别libcrypto-3.dll为OpenSSL3.5.9、zlib1.dll为1.3.1。已按官方精确tag补充各自完整许可及OpenSSL实际版权归属说明，正在重新生成Windows候选。此项补充不等于全部原生依赖分发条件已核验；后续验收须绑定新提交/产物。
+产物许可补正：实际PE版本识别libcrypto-3.dll为OpenSSL3.5.9、zlib1.dll为1.3.1。已按官方精确tag补充各自完整许可及OpenSSL实际版权归属说明，补正候选已由上述新提交/CI成功重新生成，下载后的1002文件哈希与三份新增notice逐项核对通过。此项补充不等于全部原生依赖分发条件已核验。

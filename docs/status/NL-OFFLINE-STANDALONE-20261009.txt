@@ -17,7 +17,7 @@ Github实际分支创建成功：feat/offline-inventory-standalone-20261009，�
 Windows CI固定3.13.16、独立hash安装venv、每步检查退出码，真实Windows二进制须验证隐藏Tk窗口，成功才上传候选。源码Windows假平台测试只证明构建契约，不能算Windows真实验收。
 没有读取用户节点或E盘文件，没有GCP部署、引擎下载或测量。旧/proc六项失败已在兼容Linux完整回归范围无失败，历史Windows通过不能借用。
 
-本轮最终验收（覆盖前述待回读状态）：
+首个实际成功产物（下文许可补正版已覆盖此产物指针）：
 代码提交b361e7c8a836308c7ad9c172b28ac79e73b8d403，成功CI37912081842；Windows618通过0跳过0失败，Linux离线599通过19跳过、完整回归693通过37跳过，范围重叠不相加。
 实际Windowsx64完整目录包已生成，Python3.13.16/TclTk8.6.15，冻结True且ignore_environment True。--self-check和--acceptance-check均PASS；Windows隐藏Tk窗口PASS，URI/Base64两格式及3报告往返、网络/DNS/子进程负控、输入和报告字节/mtime不变均通过。源码暂存已删除、PATH清空后执行。Windows二进制由Windows runner执行，本地Linux只做下载产物静态检查，不伪称在此处执行Windows。
 下载产物外层GitHub artifact digest匹配，内层ZIP SHA256 a363600baeaa26205ed17a7ac79f6335ec6910e72722f2122a5bdbe12c3833b5；999文件清单/全部SHA/CRC再读回通过。Windowscheckout为CRLF，builder SHA724e8b71cb24d61834525d14312e76c2b68a1acc79899600289ece2fe25ffc84；已与仓库LF源码转CRLF独立匹配，本地Linuxbuilder SHAa28d54d3995acf18993065e082b87394bcf78ffc8c12794ea5ea9c868c1eee06身份分开。
@@ -26,3 +26,9 @@ Linux当前源码CI Tcl8.6.14不受冻结profile支持，源码acceptance按预�
 草稿PR #6：https://github.com/wpuu/NodeLab/pull/6，base feat/offline-inventory-entry-20261005，未合并main。候选程序可供虚构文件试用，release_ready=false；用户Windows桌面完整验收及原生依赖许可完整核对未完成，不借用历史通过记录。
 
 产物下载复核后补充：实际PE确认OpenSSL3.5.9及zlib1.3.1，此前notice缺口已发现，不仅标记PENDING。按各自精确官方tag补完整LICENSE；OpenSSL无upstream NOTICE，另保留来源清楚的实际PE版权归属说明，不捏造上游NOTICE。重新构建后由新CI/新ZIP覆盖候选指针，完整原生许可审查仍PENDING。
+
+最终交付许可补正版（当前有效）：
+代码79d1064b34eb9429fad070b2a72280bc454504bf，成功CI37913566382；Windows618通过、Linux离线599通过19跳过、Linux完整693通过37跳过，范围重叠。
+实际WindowsZIP SHA256 14c8c8f7f3f838f755164cdd60988573610ee9135e979756cafd11584a5ed1a9，1002文件及CRC、GitHub外层artifact digest均下载再读回通过。
+准确随包补充OpenSSL3.5.9原始完整Apache2许可、实际PE版权归属说明与zlib1.3.1完整原始许可，原始tag Gitblob已校验。Windowscheckout的CRLF与上游LF对比使用换行规范化后全文一致，不假称原始字节相同。新WindowsbuilderSHA8bef509e9adeef292aab507b81f4954141818bd1c8a9711c9f0f6df3949b3fb4与本地LF源码转CRLF完全匹配。
+实际冻结双自检、隐藏Tk、虚构输入/报告往返与网络/DNS/子进程负控再通过；最新产物与最早Linux源码拒绝profile/过去成功产物的证据保持分开。完整原生依赖许可复核仍PENDING、release_ready=false，用户Windows本机桌面验收仍待进行。
