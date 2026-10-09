@@ -1,19 +1,30 @@
 # NodeLab 当前状态
 
-更新：2026-10-09（Asia/Shanghai）；执行助手：Codex，细分模型未独立核验。
+更新：2026-10-09（北京时间）；执行助手：Codex，细分模型未独立核验。
 
-当前隔离候选包含显式Base64离线入口、输入格式记录、保存报告只读核对与原生桌面打包流程。固定入口基线 fe8c1399af7485aff70ead0015b5ab6dd6441455。本轮GitHub写入已恢复，候选分支 feat/offline-inventory-standalone-20261009 已创建；已保存代码提交44a68b5e17416496851270fa1cf7df9a484fd161及草稿PR #6：https://github.com/wpuu/NodeLab/pull/6。
+Windows x64 独立桌面候选已实际构建，内含Python3.13.16/Tcl/Tk8.6.15，用户无需预装Python。冻结程序在删除源码暂存、清空PATH后实际通过自检、虚构URI/Base64处理、三次报告往返、匿名错误、文件不改写、网络/DNS/子进程阻断及隐藏Tk窗口。生成ZIP成功后逐项文件哈希读回通过；下载产物再次核对999个文件、压缩包哈希与CRC。用户Windows电脑完整桌面验收仍未完成。
 
-本地离线验收578通过、18跳过。原生Linux冻结程序已实际构建，自带Python/Tcl，源码暂存删除、PATH清空后两种自检通过；重新解压、邻近旧源码和PYTHONPATH干扰下通过，网络系统调用拒绝条件下同二进制通过。明确这是Linux内部验证，未执行Windows桌面验收，Linux二进制不作为Windows交付。
+实际代码提交：b361e7c8a836308c7ad9c172b28ac79e73b8d403。
+候选分支：feat/offline-inventory-standalone-20261009。
+草稿审查：https://github.com/wpuu/NodeLab/pull/6
+成功CI：https://github.com/wpuu/NodeLab/actions/runs/37912081842
+审查目标为既有离线入口分支；main未合并。
 
-新builder只使用最小离线模块白名单、固定依赖及官方wheel哈希、无system-site-packages的隔离venv。校验PYZ仅含7个NodeLab离线模块；冻结程序须通过虚构输入两格式、三报告往返、只读快照、匿名输出、不一致拒绝与网络/子进程阻断。构建成功且哈希写完后才发布完成ZIP。失败不残留完成ZIP/hash。
+| 实际验收 | 通过 | 跳过 | 失败 |
+| --- | ---: | ---: | ---: |
+| Windows离线/桌面测试 | 618 | 0 | 0 |
+| Linux离线验收 | 599 | 19 | 0 |
+| Linux完整回归 | 693 | 37 | 0 |
 
-首轮CI 37909168353因Windows无3.12.14二进制安装包及Linux源码测试Tcl环境差异失败，未生成Windows程序。已按官方setup-python manifest调整Windows为Python3.13.16原生x64、Linux源码CI为3.12.15；本地Linux冻结验证保持3.12.14。运行时契约与故障注入测试同步修正，冻结包验收门槛不放宽。二轮CI 37910107868：Linux离线582通过18跳过、完整回归676通过36跳过；Windows97失败503通过，报告读取被文件元数据比较拒绝。CPython3.13.16源码与官方issue #157671确认Windows路径stat的ctime为创建时间、句柄fstat的ctime为ChangeTime。修正为跨API比较birthtime，dev/ino/size/mtime/attributes仍严格一致；同API前后仍比较完整ctime和birthtime。第三轮CI 37910878294：Windows614通过1失败，身份兼容修正有效；剩唯一测试夹具把Markdown写为CRLF，被正确拒绝。夹具改为固定LF，读取器逐字节校验保留；第四轮CI 37911322175：Windows614通过1失败，已读marker快速改写的跨文件检查未拒绝。修正为末轮重新打开、比同通道完整fd身份，并按原上限流式读回每份报告与首次字节指纹比较；哈希仅留进程内，不输出或保存。该检查加强变化检测，仍不构成原子快照或来源认证；第五轮CI待回读。Windows流程须由实际Windows runner构建并通过冻结自检/隐藏Tk窗口，再产生Windows候选。当前目标是完整目录包，自带运行时且不要求用户预装Python；必须保留_internal目录。构建配方已准备，不等于Windows程序已生成或用户电脑实测通过。
+计数范围重叠，不相加。Linux源码CI为3.12.15/Tcl8.6.14，源码acceptance严格拒绝不支持的Tcl profile，该拒绝路径按预期通过。独立Linux3.12.14/Tcl9.0.4冻结程序另有真实构建/解压/旧源码与PYTHONPATH干扰/系统调用网络拒绝证据，不能替代Windows。
 
-- [本轮独立桌面候选记录](NL-OFFLINE-STANDALONE-20261009.txt)
-- [报告核对记录](NL-OFFLINE-REPORT-CHECK-20261009.txt)
-- [格式记录](NL-OFFLINE-INPUT-METADATA-20261009.txt)
-- [源码包使用说明](../NodeLab_Offline_Readme.txt)
-- [构建后Windows桌面包说明](../NodeLab_Standalone_Readme.txt)
+报告核对保留严格schema、内容逐字节一致与类型/身份/重解析点检查。Windows跨stat API比较明确birthtime，各自前后仍核对完整ctime。返回前按原字节上限重新读回三报告，以内部摘要识别元数据不变的改写。内部摘要不输出或保存；该流程仍非原子快照、作者或原始输入认证。
 
-包仍为开发候选。依赖原生库许可证完整清单、用户Windows桌面及真实节点验收均未完成。清单指纹不是签名。此前/proc环境六项失败在真实Linux全套回归范围已无失败；历史Windows114项不可用于新版本。生产探测关闭，未部署或合并main。
+此前/proc环境六项失败已在成功Linux完整回归的JUnit逐项确认通过。构建依赖固定8包及18个官方wheel哈希，独立venv无system-site-packages；程序只包含7个NodeLab离线模块，模块白名单已由实际Windows构建检查。
+
+候选内运行时许可notice已随包复制，原生依赖许可完整核对仍PENDING；release_ready=false。清单指纹不是发布签名。未执行用户Windows本机或真实节点验收，生产探测关闭。下一步仅使用虚构文件完成Windows本机桌面验收，再处理候选发布条件。
+
+- [独立桌面候选与本轮验收记录](NL-OFFLINE-STANDALONE-20261009.txt)
+- [报告核对历史记录](NL-OFFLINE-REPORT-CHECK-20261009.txt)
+- [输入格式历史记录](NL-OFFLINE-INPUT-METADATA-20261009.txt)
+- [构建后Windows包说明](../NodeLab_Standalone_Readme.txt)
