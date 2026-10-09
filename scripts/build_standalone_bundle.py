@@ -21,6 +21,7 @@ ROOT = Path(__file__).resolve().parents[1]
 PINS = {"pyinstaller": "6.22.3", "pyinstaller-hooks-contrib": "2026.8", "idna": "3.20",
         "altgraph": "0.17.5", "packaging": "26.3", "setuptools": "84.0.0"}
 WINDOWS_PINS = {"pefile": "2024.8.26", "pywin32-ctypes": "0.2.3"}
+PYTHON_PROFILES = {"Windows": "3.13.16", "Linux": "3.12.14"}
 OFFLINE_MODULES = frozenset({"nodelab", "nodelab.types", "nodelab.parser", "nodelab.inventory",
                             "nodelab.subscription_input", "nodelab.offline_file", "nodelab.offline_report"})
 EXCLUDES = ("nodelab.cli", "nodelab.probe", "nodelab.redaction", "nodelab.mihomo_config",
@@ -40,7 +41,7 @@ def _target() -> str:
     target = platform.system()
     if target not in {"Windows", "Linux"} or platform.machine().lower() not in {"amd64", "x86_64"} or struct.calcsize("P") != 8:
         raise StandaloneBuildError("BUILD_PLATFORM")
-    if platform.python_version() != "3.12.14":
+    if platform.python_version() != PYTHON_PROFILES[target]:
         raise StandaloneBuildError("BUILD_RUNTIME")
     return target
 
@@ -152,7 +153,7 @@ def _copy_licenses(app: Path) -> dict:
     license_dir = app / "licenses"
     license_dir.mkdir()
     python_license = next((p for p in (Path(sys.base_prefix) / "LICENSE.txt",
-                           Path(sys.base_prefix) / "lib/python3.12/LICENSE.txt") if p.is_file()), None)
+                           Path(sys.base_prefix) / f"lib/python{sys.version_info.major}.{sys.version_info.minor}/LICENSE.txt") if p.is_file()), None)
     if python_license is None:
         raise StandaloneBuildError("BUILD_LICENSE")
     shutil.copyfile(python_license, license_dir / "Python-LICENSE.txt")

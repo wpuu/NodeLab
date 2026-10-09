@@ -128,6 +128,8 @@ def test_staging_excludes_unrelated_project_modules_and_real_input(
         ("Linux", "aarch64", 8, "3.12.14", "BUILD_PLATFORM"),
         ("Windows", "AMD64", 4, "3.12.14", "BUILD_PLATFORM"),
         ("Windows", "AMD64", 8, "3.12.13", "BUILD_RUNTIME"),
+        ("Windows", "AMD64", 8, "3.12.14", "BUILD_RUNTIME"),
+        ("Linux", "x86_64", 8, "3.13.16", "BUILD_RUNTIME"),
     ],
 )
 def test_target_rejects_unsupported_native_build_profile(
@@ -140,6 +142,15 @@ def test_target_rejects_unsupported_native_build_profile(
     with pytest.raises(builder.StandaloneBuildError) as caught:
         builder._target()
     assert caught.value.code == code
+
+
+@pytest.mark.parametrize(("system", "version"), [("Windows", "3.13.16"), ("Linux", "3.12.14")])
+def test_target_accepts_only_its_pinned_native_runtime(monkeypatch, builder, system, version):
+    monkeypatch.setattr(builder.platform, "system", lambda: system)
+    monkeypatch.setattr(builder.platform, "machine", lambda: "x86_64")
+    monkeypatch.setattr(builder.platform, "python_version", lambda: version)
+    monkeypatch.setattr(builder.struct, "calcsize", lambda format: 8)
+    assert builder._target() == system
 
 
 @pytest.mark.parametrize("dependency", ["pyinstaller", "idna", "pyinstaller-hooks-contrib", "pefile"])

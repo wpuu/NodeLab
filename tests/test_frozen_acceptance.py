@@ -30,8 +30,25 @@ def _child(code, *args):
     )
 
 
-def test_source_acceptance_is_complete_and_anonymous():
+def test_source_acceptance_follows_exact_runtime_profile_without_leaks(request):
     completed = _source("--acceptance-check")
+    actual_tcl_patchlevel = tkinter.Tcl().eval("info patchlevel")
+    recorded_version = actual_tcl_patchlevel if all(
+        part.isdecimal() for part in actual_tcl_patchlevel.split(".")
+    ) and len(actual_tcl_patchlevel.split(".")) == 3 else "UNRECOGNIZED"
+    request.node.user_properties.extend([
+        ("source_python_version", ".".join(map(str, sys.version_info[:3]))),
+        ("source_tcl_patchlevel", recorded_version),
+        ("source_runtime_acceptance", "SUPPORTED_PROFILE" if actual_tcl_patchlevel in {"8.6.15", "9.0.4"} else "REJECTED_PROFILE"),
+    ])
+    if actual_tcl_patchlevel not in {"8.6.15", "9.0.4"}:
+        # A source test on a runner with an unsupported Tcl is expected to
+        # reject, not to masquerade as a native build acceptance result.
+        assert completed.returncode == 2
+        assert completed.stdout == ""
+        assert completed.stderr.strip() == "ACCEPTANCE_FAILED"
+        assert PRIVATE not in completed.stderr
+        return
     assert completed.returncode == 0, completed.stderr
     assert completed.stderr == ""
     assert json.loads(completed.stdout) == {
@@ -48,8 +65,8 @@ def test_source_acceptance_is_complete_and_anonymous():
         },
         "tcl_runtime": "PASS",
         "gui_runtime": "WINDOWS_HIDDEN_WINDOW_PASS" if os.name == "nt" else "NOT_CHECKED_NO_DISPLAY",
-        "tcl_patchlevel": tkinter.Tcl().eval("info patchlevel"),
-        "tk_patchlevel": tkinter.Tcl().eval("info patchlevel") if os.name == "nt" else None,
+        "tcl_patchlevel": actual_tcl_patchlevel,
+        "tk_patchlevel": actual_tcl_patchlevel if os.name == "nt" else None,
     }
     for value in ("FICTIONAL_PASSWORD", "private-host-a741", "FICTIONAL_FRAGMENT", "FICTIONAL_SECRET_LINE",
                   "FICTIONAL_FILENAME", "FICTIONAL_MISMATCH", "nodelab-fictional-", str(ENTRY)):
@@ -130,16 +147,48 @@ from pathlib import Path
 entry = runpy.run_path(sys.argv[1], run_name="acceptance_fault_injection")
 globals_ = entry["main"].__globals__
 fault = sys.argv[2]
+reached_fault = []
 import nodelab.offline_file as writer
 import nodelab.offline_report as reader
+# These are fault-isolation fixtures, not native runtime evidence. A runner's
+# unrelated Tcl version must not reject before the intended fault is reached.
+import tkinter
+class SupportedTcl:
+    def eval(self, expression):
+        if expression == "expr {1 + 1}":
+            return "2"
+        if expression == "info patchlevel":
+            return "8.6.15"
+        raise AssertionError("FICTIONAL_PRIVATE_FAILURE_CANARY_Z917")
+class SupportedTk:
+    def __init__(self):
+        self.tk = self
+    def eval(self, expression):
+        if expression == "package provide Tk":
+            return "8.6.15"
+        raise AssertionError("FICTIONAL_PRIVATE_FAILURE_CANARY_Z917")
+    def withdraw(self):
+        pass
+    def update_idletasks(self):
+        pass
+    def update(self):
+        pass
+    def state(self):
+        return "withdrawn"
+    def destroy(self):
+        pass
+tkinter.Tcl = SupportedTcl
+tkinter.Tk = SupportedTk
 if fault == "unexpected_exception":
     def fail():
+        reached_fault.append("FAULT")
         raise RuntimeError("FICTIONAL_PRIVATE_FAILURE_CANARY_Z917")
     globals_["_acceptance_check"] = fail
 elif fault == "metadata_changed":
     original = reader.load_reports
     def altered(folder):
         result = original(folder)
+        reached_fault.append("FAULT")
         result["metadata"]["decoding_passes"] = True
         return result
     reader.load_reports = altered
@@ -147,6 +196,7 @@ elif fault == "input_mtime_changed":
     original = writer.run_file
     def altered(source, destination, **kwargs):
         result = original(source, destination, **kwargs)
+        reached_fault.append("FAULT")
         info = source.stat()
         os.utime(source, ns=(info.st_atime_ns, info.st_mtime_ns + 2_000_000_000))
         return result
@@ -155,6 +205,7 @@ elif fault == "report_mtime_changed":
     original = reader.load_reports
     def altered(folder):
         result = original(folder)
+        reached_fault.append("FAULT")
         path = folder / "COMPLETE.json"
         info = path.stat()
         os.utime(path, ns=(info.st_atime_ns, info.st_mtime_ns + 2_000_000_000))
@@ -166,6 +217,7 @@ elif fault == "mismatch_accepted":
         try:
             return original(folder)
         except reader.OfflineReportError:
+            reached_fault.append("FAULT")
             return {"FICTIONAL_PRIVATE_FAILURE_CANARY_Z917": True}
     reader.load_reports = altered
 elif fault == "engine_imported":
@@ -195,18 +247,18 @@ elif fault == "tcl_failure":
     import tkinter
     class BrokenTcl:
         def eval(self, expression):
+            reached_fault.append("FAULT")
             raise RuntimeError("FICTIONAL_PRIVATE_FAILURE_CANARY_Z917")
     tkinter.Tcl = BrokenTcl
 elif fault == "unsupported_tcl_patchlevel":
     import tkinter
     class UnsupportedTcl:
         def eval(self, expression):
+            if expression == "info patchlevel":
+                reached_fault.append("FAULT")
             return "2" if expression == "expr {1 + 1}" else "FICTIONAL_PRIVATE_FAILURE_CANARY_Z917"
     tkinter.Tcl = UnsupportedTcl
 elif fault == "mismatched_tk_patchlevel":
-    import tkinter
-    actual_tcl = tkinter.Tcl()
-    tkinter.Tcl = lambda: actual_tcl
     globals_["os"] = types.SimpleNamespace(name="nt")
     reached_tk_patchlevel = []
     class MismatchedTk:
@@ -229,6 +281,9 @@ elif fault == "mismatched_tk_patchlevel":
     tkinter.Tk = MismatchedTk
 sys.argv = [sys.argv[1], "--acceptance-check"]
 returned = entry["main"]()
+if fault in {"unexpected_exception", "metadata_changed", "input_mtime_changed", "report_mtime_changed",
+             "mismatch_accepted", "tcl_failure", "unsupported_tcl_patchlevel"} and not reached_fault:
+    raise SystemExit(57)
 if fault == "mismatched_tk_patchlevel" and reached_tk_patchlevel != ["package provide Tk"]:
     raise SystemExit(57)
 if fault == "frozen_environment_not_ignored" and environment_probe_events:
@@ -249,7 +304,9 @@ import json, runpy, sys
 entry = runpy.run_path(sys.argv[1], run_name="windowed_acceptance")
 operation = sys.argv[2]
 globals_ = entry["main"].__globals__
-if operation != "pass_without_stdout":
+if operation == "pass_without_stdout":
+    globals_["_acceptance_check"] = lambda: {"acceptance_check": "PASS"}
+else:
     def fail():
         raise RuntimeError("FICTIONAL_PRIVATE_FAILURE_CANARY_Z917")
     globals_["install_offline_guard" if operation == "guard_install_failure_without_streams" else "_acceptance_check"] = fail
