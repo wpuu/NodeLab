@@ -20,7 +20,9 @@ SOURCE_FILES = {
     "src/nodelab/types.py": "nodelab/types.py",
     "src/nodelab/parser.py": "nodelab/parser.py",
     "src/nodelab/inventory.py": "nodelab/inventory.py",
+    "src/nodelab/subscription_input.py": "nodelab/subscription_input.py",
     "src/nodelab/offline_file.py": "nodelab/offline_file.py",
+    "src/nodelab/offline_report.py": "nodelab/offline_report.py",
 }
 
 
