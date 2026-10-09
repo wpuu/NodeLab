@@ -526,7 +526,7 @@ def test_coherent_anonymous_files_are_not_claimed_to_authenticate_original_input
     marker.update(EXPECTED_METADATA["base64"])
     _write_json(folder / "COMPLETE.json", marker)
     report = _json(folder / "inventory.json")
-    (folder / "inventory.md").write_text(render_inventory_report(report, input_format="base64"), encoding="utf-8")
+    (folder / "inventory.md").write_text(render_inventory_report(report, input_format="base64"), encoding="utf-8", newline="\n")
     result = load_reports(folder)
     assert result["metadata"] == EXPECTED_METADATA["base64"]
     assert "source_authenticated" not in result

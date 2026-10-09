@@ -49,6 +49,9 @@ jobs:
         run: python -m pip install --disable-pip-version-check -e . pytest idna==3.20
       - name: Inventory and parser acceptance with fictional inputs
         run: python -m pytest --override-ini addopts='' -q tests/test_inventory.py tests/test_inventory_cli.py tests/test_strict_parser.py tests/test_trojan_parser.py tests/test_vless_parser.py tests/test_redaction.py tests/test_offline_file.py tests/test_offline_bundle.py tests/test_offline_gui.py tests/test_subscription_input.py tests/test_subscription_entry.py tests/test_input_metadata.py tests/test_input_metadata_entry.py tests/test_offline_report.py tests/test_offline_report_entry.py tests/test_frozen_acceptance.py tests/test_standalone_bundle.py --junitxml=offline-acceptance.xml
+      - name: Emit anonymous native runtime test evidence
+        run: >-
+          python -c "import json,xml.etree.ElementTree as E; r=E.parse('offline-acceptance.xml').getroot(); s=r.find('testsuite'); keys={'source_python_version','source_tcl_patchlevel','source_runtime_acceptance','identity_fields_match','ctime_api_matches','birthtime_available','birthtime_matches'}; print('OFFLINE_RUNTIME_EVIDENCE=' + json.dumps({'results':{k:s.get(k) for k in ('tests','failures','errors','skipped')},'properties':{p.get('name'):p.get('value') for p in r.findall('.//property') if p.get('name') in keys}},sort_keys=True))"
       - name: Linux main regression (no real nodes or engine download)
         if: runner.os == 'Linux'
         run: python -m pytest --override-ini addopts='' -q --junitxml=offline-regression.xml
@@ -80,6 +83,10 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           .\.standalone-venv\Scripts\python.exe -I scripts/build_standalone_bundle.py --output-dir generated-standalone
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Read back standalone archive hashes and anonymous acceptance
+        if: runner.os == 'Windows'
+        run: >-
+          python -c "import hashlib,json,os,pathlib,zipfile; files=list(pathlib.Path('generated-standalone').glob('build-*/NodeLab_Offline_Windows_x64.zip')); assert len(files)==1; p=files[0]; digest=hashlib.sha256(p.read_bytes()).hexdigest(); assert digest==pathlib.Path(str(p)+'.sha256').read_text().split()[0]; z=zipfile.ZipFile(p); prefix='NodeLab_Offline_Windows_x64/'; m=json.loads(z.read(prefix+'MANIFEST.json')); assert m['code_commit']==os.environ['GITHUB_SHA']; assert set(z.namelist())=={prefix+n for n in m['sha256']}|{prefix+'MANIFEST.json'}; assert all(hashlib.sha256(z.read(prefix+n)).hexdigest()==d for n,d in m['sha256'].items()); keys=('code_commit','builder_sha256','platform','architecture','python_build_version','validation_only','windows_desktop_user_acceptance','release_ready','native_dependency_license_review','checks','licenses','offline_modules'); print('STANDALONE_ARCHIVE_EVIDENCE=' + json.dumps({'archive_sha256':digest,'file_hash_readback':'PASS','files':len(m['sha256']),**{k:m[k] for k in keys}},sort_keys=True))"
       - name: Upload fictional build diagnostics on failure
         if: failure() && runner.os == 'Windows'
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
