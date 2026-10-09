@@ -24,3 +24,5 @@ Windows CI固定3.13.16、独立hash安装venv、每步检查退出码，真实W
 Linux当前源码CI Tcl8.6.14不受冻结profile支持，源码acceptance按预期匿名拒绝；与本地Tcl9.0.4真冻结程序PASS的证据分开。Linux完整JUnit逐项复核此前/proc六项case全部PASS。
 报告最终内容读回回归覆盖三组件同长度改写、mtime恢复、全部metadata冻结仍拒绝；原跨组件故障测试未弱化且未加sleep。哈希只在进程内部用于一致性，不保存或返回。仍非原子快照或作者/原输入认证。
 草稿PR #6：https://github.com/wpuu/NodeLab/pull/6，base feat/offline-inventory-entry-20261005，未合并main。候选程序可供虚构文件试用，release_ready=false；用户Windows桌面完整验收及原生依赖许可完整核对未完成，不借用历史通过记录。
+
+产物下载复核后补充：实际PE确认OpenSSL3.5.9及zlib1.3.1，此前notice缺口已发现，不仅标记PENDING。按各自精确官方tag补完整LICENSE；OpenSSL无upstream NOTICE，另保留来源清楚的实际PE版权归属说明，不捏造上游NOTICE。重新构建后由新CI/新ZIP覆盖候选指针，完整原生许可审查仍PENDING。

@@ -28,3 +28,5 @@ Windows x64 独立桌面候选已实际构建，内含Python3.13.16/Tcl/Tk8.6.15
 - [报告核对历史记录](NL-OFFLINE-REPORT-CHECK-20261009.txt)
 - [输入格式历史记录](NL-OFFLINE-INPUT-METADATA-20261009.txt)
 - [构建后Windows包说明](../NodeLab_Standalone_Readme.txt)
+
+产物许可补正：实际PE版本识别libcrypto-3.dll为OpenSSL3.5.9、zlib1.dll为1.3.1。已按官方精确tag补充各自完整许可及OpenSSL实际版权归属说明，正在重新生成Windows候选。此项补充不等于全部原生依赖分发条件已核验；后续验收须绑定新提交/产物。

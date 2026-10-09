@@ -172,8 +172,16 @@ def _copy_licenses(app: Path) -> dict:
         shutil.copyfile(ROOT / "docs/licenses" / f"{name}-{version}-license.terms", license_dir / f"{name}-LICENSE.txt")
     for name in ("PYINSTALLER_COPYING.txt", "PYINSTALLER_BOOTLOADER_ZLIB_LICENSE.txt"):
         shutil.copyfile(ROOT / "docs/licenses" / name, license_dir / name)
-    return {"python": platform.python_version(), "tcl_license_source_version": version,
-            "tk_license_source_version": version, "runtime_hooks_license": "Apache-2.0"}
+    licenses = {"python": platform.python_version(), "tcl_license_source_version": version,
+                "tk_license_source_version": version, "runtime_hooks_license": "Apache-2.0"}
+    if platform.system() == "Windows":
+        # The pinned CPython Windows runtime's actual DLL versions were read
+        # from its PE metadata. Preserve these runtime notices separately from
+        # PyInstaller's own Apache/zlib texts; full native review is still pending.
+        for name in ("OPENSSL_3.5.9_LICENSE.txt", "OPENSSL_3.5.9_ATTRIBUTION.txt", "ZLIB_1.3.1_LICENSE.txt"):
+            shutil.copyfile(ROOT / "docs/licenses" / name, license_dir / name)
+        licenses.update(openssl_license_source_version="3.5.9", zlib_license_source_version="1.3.1")
+    return licenses
 
 
 def _verify_frozen(executable: Path, work: Path, target: str) -> dict:
