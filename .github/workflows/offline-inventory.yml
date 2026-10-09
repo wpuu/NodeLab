@@ -10,7 +10,11 @@ name: Offline inventory synthetic acceptance
       - 'scripts/nodelab_offline.pyw'
       - 'scripts/NodeLab_Offline.cmd'
       - 'scripts/build_offline_bundle.py'
+      - 'scripts/build_standalone_bundle.py'
       - 'docs/NodeLab_Offline_Readme.txt'
+      - 'docs/NodeLab_Standalone_Readme.txt'
+      - 'docs/licenses/**'
+      - 'requirements-standalone-build.txt'
       - 'pyproject.toml'
       - '.github/workflows/offline-inventory.yml'
 
@@ -25,7 +29,11 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-24.04, windows-2022]
+        include:
+          - os: ubuntu-24.04
+            python: '3.12.15'
+          - os: windows-2022
+            python: '3.13.16'
     env:
       PYTHONPATH: src
       PYTHONUTF8: '1'
@@ -36,22 +44,70 @@ jobs:
           persist-credentials: false
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # verified v5 tag, 2026-10-04
         with:
-          python-version: '3.12'
+          python-version: ${{ matrix.python }}
       - name: Install project and test dependencies
         run: python -m pip install --disable-pip-version-check -e . pytest idna==3.20
       - name: Inventory and parser acceptance with fictional inputs
-        run: python -m pytest --override-ini addopts='' -q tests/test_inventory.py tests/test_inventory_cli.py tests/test_strict_parser.py tests/test_trojan_parser.py tests/test_vless_parser.py tests/test_redaction.py tests/test_offline_file.py tests/test_offline_bundle.py tests/test_offline_gui.py --junitxml=offline-acceptance.xml
+        run: python -m pytest --override-ini addopts='' -q tests/test_inventory.py tests/test_inventory_cli.py tests/test_strict_parser.py tests/test_trojan_parser.py tests/test_vless_parser.py tests/test_redaction.py tests/test_offline_file.py tests/test_offline_bundle.py tests/test_offline_gui.py tests/test_subscription_input.py tests/test_subscription_entry.py tests/test_input_metadata.py tests/test_input_metadata_entry.py tests/test_offline_report.py tests/test_offline_report_entry.py tests/test_frozen_acceptance.py tests/test_standalone_bundle.py --junitxml=offline-acceptance.xml
+      - name: Emit anonymous native runtime test evidence
+        run: >-
+          python -c "import json,xml.etree.ElementTree as E; r=E.parse('offline-acceptance.xml').getroot(); s=r.find('testsuite'); keys={'source_python_version','source_tcl_patchlevel','source_runtime_acceptance','identity_fields_match','ctime_api_matches','birthtime_available','birthtime_matches'}; print('OFFLINE_RUNTIME_EVIDENCE=' + json.dumps({'results':{k:s.get(k) for k in ('tests','failures','errors','skipped')},'properties':{p.get('name'):p.get('value') for p in r.findall('.//property') if p.get('name') in keys}},sort_keys=True))"
       - name: Linux main regression (no real nodes or engine download)
         if: runner.os == 'Linux'
         run: python -m pytest --override-ini addopts='' -q --junitxml=offline-regression.xml
       - name: Generate safe synthetic sample and evidence
         run: python scripts/inventory_demo.py --output-dir generated-examples --emit-evidence
+      - name: Upload Linux fictional acceptance and regression results
+        if: runner.os == 'Linux'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: nodelab-linux-fictional-acceptance
+          path: |
+            offline-acceptance.xml
+            offline-regression.xml
+          if-no-files-found: error
+          retention-days: 14
       - name: Check Windows Tk runtime
         if: runner.os == 'Windows'
         run: python -c "import tkinter; window=tkinter.Tk(); window.withdraw(); window.update(); window.destroy(); print('WINDOWS_TK_RUNTIME_PASS')"
       - name: Build minimal entry bundle
         if: runner.os == 'Windows'
         run: python scripts/build_offline_bundle.py --output-dir generated-bundle
+      - name: Build native standalone candidate and verify frozen fictional flows
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          python -m venv .standalone-venv
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          .\.standalone-venv\Scripts\python.exe -I -m pip install --disable-pip-version-check --require-hashes --only-binary=:all: -r requirements-standalone-build.txt
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          .\.standalone-venv\Scripts\python.exe -I scripts/build_standalone_bundle.py --output-dir generated-standalone
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Read back standalone archive hashes and anonymous acceptance
+        if: runner.os == 'Windows'
+        run: >-
+          python -c "import hashlib,json,os,pathlib,zipfile; files=list(pathlib.Path('generated-standalone').glob('build-*/NodeLab_Offline_Windows_x64.zip')); assert len(files)==1; p=files[0]; digest=hashlib.sha256(p.read_bytes()).hexdigest(); assert digest==pathlib.Path(str(p)+'.sha256').read_text().split()[0]; z=zipfile.ZipFile(p); prefix='NodeLab_Offline_Windows_x64/'; m=json.loads(z.read(prefix+'MANIFEST.json')); assert m['code_commit']==os.environ['GITHUB_SHA']; assert set(z.namelist())=={prefix+n for n in m['sha256']}|{prefix+'MANIFEST.json'}; assert all(hashlib.sha256(z.read(prefix+n)).hexdigest()==d for n,d in m['sha256'].items()); keys=('code_commit','builder_sha256','platform','architecture','python_build_version','validation_only','windows_desktop_user_acceptance','release_ready','native_dependency_license_review','checks','licenses','offline_modules'); print('STANDALONE_ARCHIVE_EVIDENCE=' + json.dumps({'archive_sha256':digest,'file_hash_readback':'PASS','files':len(m['sha256']),**{k:m[k] for k in keys}},sort_keys=True))"
+      - name: Upload fictional build diagnostics on failure
+        if: failure() && runner.os == 'Windows'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: nodelab-standalone-build-diagnostics
+          path: |
+            generated-standalone/build-*/compile.stdout
+            generated-standalone/build-*/compile.stderr
+          if-no-files-found: ignore
+          retention-days: 7
+      - name: Upload standalone candidate with frozen acceptance manifest
+        if: runner.os == 'Windows'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: nodelab-offline-standalone-candidate
+          path: |
+            generated-standalone/build-*/NodeLab_Offline_Windows_x64.zip
+            generated-standalone/build-*/NodeLab_Offline_Windows_x64.zip.sha256
+            offline-acceptance.xml
+          if-no-files-found: error
+          retention-days: 14
       - name: Upload fictional acceptance evidence and entry bundle
         if: runner.os == 'Windows'
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # verified v4 tag, 2026-10-05

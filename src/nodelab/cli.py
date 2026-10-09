@@ -15,6 +15,7 @@ from nodelab.inventory import (
 from nodelab.mihomo_config import PrivateRunError, recover_stale_runs
 from nodelab.parser import parse_uris
 from nodelab.redaction import redacted_result_dict
+from nodelab.subscription_input import decode_subscription_input
 from nodelab.types import PROBE_GATE_OPEN
 
 _MAX_INPUT_BYTES = 512 * 1024
@@ -88,11 +89,11 @@ def _inventory_failure(code: str) -> int:
     return 2
 
 
-def _emit_inventory(data: bytes, output_format: str) -> int:
+def _emit_inventory(data: bytes, output_format: str, input_format: str = "uri_lines") -> int:
     try:
-        report = build_inventory(data)
+        report = build_inventory(decode_subscription_input(data, input_format=input_format))
         validate_inventory(report)
-        output = render_inventory_report(report) if output_format == "markdown" else json.dumps(report, ensure_ascii=False, separators=(",", ":"))
+        output = render_inventory_report(report, input_format=input_format) if output_format == "markdown" else json.dumps(report, ensure_ascii=False, separators=(",", ":"))
     except InventoryInputError as exc:
         return _inventory_failure(exc.code)
     except Exception:
@@ -113,7 +114,7 @@ def _cmd_inventory_file(args: argparse.Namespace) -> int:
             data = handle.read(MAX_INPUT_BYTES + 1)
     except (OSError, ValueError):
         return _inventory_failure("INPUT_FILE_UNSAFE")
-    return _emit_inventory(data, args.format)
+    return _emit_inventory(data, args.format, args.input_format)
 
 
 def _cmd_inventory_stdin(args: argparse.Namespace) -> int:
@@ -123,7 +124,7 @@ def _cmd_inventory_stdin(args: argparse.Namespace) -> int:
         data = sys.stdin.buffer.read(MAX_INPUT_BYTES + 1)
     except (OSError, ValueError, AttributeError):
         return _inventory_failure("INPUT_FILE_UNSAFE")
-    return _emit_inventory(data, args.format)
+    return _emit_inventory(data, args.format, args.input_format)
 
 
 def _cmd_recover(args: argparse.Namespace) -> int:
@@ -160,8 +161,12 @@ def main(argv: list[str] | None = None) -> int:
     p_if = sub.add_parser("inventory-file", help="Inventory all bounded offline input; no live-node verdicts")
     p_if.add_argument("--file", required=True)
     p_if.add_argument("--format", choices=("json", "markdown"), default="json")
+    p_if.add_argument("--input-format", choices=("uri_lines", "base64"), default="uri_lines",
+                      help="Explicit local input format; reported lines refer to decoded text for Base64")
     p_is = sub.add_parser("inventory-stdin", help="Inventory a protected-file pipe without probing")
     p_is.add_argument("--format", choices=("json", "markdown"), default="json")
+    p_is.add_argument("--input-format", choices=("uri_lines", "base64"), default="uri_lines",
+                      help="Explicit input format; never fetches subscription URLs or guesses")
     p_probe = sub.add_parser("probe-file", help="Reserved until route-proof and Windows gates")
     p_probe.add_argument("--file", required=True)
     p_probe.add_argument("--limit", type=int, default=1)

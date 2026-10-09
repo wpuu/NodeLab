@@ -19,7 +19,7 @@ _DIALECTS = frozenset({
 })
 _INPUT_CODES = frozenset({
     "INPUT_TOO_LARGE", "INVALID_UTF8", "INPUT_TYPE_INVALID", "INPUT_FILE_UNSAFE",
-    "PUBLIC_SCHEMA_REJECTED", "INVALID_ARGUMENTS", "INVENTORY_FAILED",
+    "PUBLIC_SCHEMA_REJECTED", "INVALID_ARGUMENTS", "INVENTORY_FAILED", "INVALID_BASE64",
 })
 _ROW_KEYS = frozenset({
     "record_id", "line_number", "parse_status", "protocol", "transport", "tls_mode",
@@ -221,13 +221,39 @@ def validate_inventory(report: Any) -> None:
         reject()
 
 
-def render_inventory_report(report: dict[str, Any]) -> str:
+def build_input_metadata(input_format: str = "not_recorded") -> dict[str, Any]:
+    """Record a caller's processing choice without inferring private content."""
+    if type(input_format) is not str or input_format not in {"uri_lines", "base64", "not_recorded"}:
+        raise InventoryInputError("INVALID_ARGUMENTS")
+    return {
+        "uri_lines": {"input_format": "uri_lines", "line_number_basis": "source_text", "decoding_passes": 0},
+        "base64": {"input_format": "base64", "line_number_basis": "decoded_text", "decoding_passes": 1},
+        "not_recorded": {"input_format": "not_recorded", "line_number_basis": "parser_text", "decoding_passes": None},
+    }[input_format]
+
+
+def render_inventory_report(report: dict[str, Any], *, input_format: str = "not_recorded") -> str:
     """Render the validated public result, never the private parser objects."""
     validate_inventory(report)
+    metadata = build_input_metadata(input_format)
+    format_text = {
+        "uri_lines": "逐行 URI 文本（未展开外层包装）",
+        "base64": "Base64 订阅文本（单次解码）",
+        "not_recorded": "未记录（不能由匿名统计推断）",
+    }[metadata["input_format"]]
+    line_text = {
+        "source_text": "源文本行",
+        "decoded_text": "单次解码后的文本行",
+        "parser_text": "交给解析器的文本行；原始包装方式未知",
+    }[metadata["line_number_basis"]]
+    decoding_text = "未记录" if metadata["decoding_passes"] is None else str(metadata["decoding_passes"])
     s = report["summary"]
     text = [
         "# NodeLab 离线资产盘点", "",
         "范围：全部受限输入已处理；未联网、未启动代理引擎、未测真实节点。", "",
+        "输入格式：" + format_text + "。",
+        "物理行和输入行的依据：" + line_text + "。",
+        "外层解码次数：" + decoding_text + "。", "",
         "| 项目 | 数量 |", "| --- | ---: |",
     ]
     labels = {

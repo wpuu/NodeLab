@@ -1,0 +1,21 @@
+OpenSSL 3.5.9 bundled component attribution
+
+This attribution note was prepared by NodeLab from the observed metadata of
+its bundled Windows libcrypto-3.dll. It is not an upstream NOTICE file and
+it does not modify the original OpenSSL license text.
+
+Bundled file: _internal/libcrypto-3.dll
+Product name: The OpenSSL Toolkit
+Product version: 3.5.9
+Company name: The OpenSSL Project, https://www.openssl.org/
+Copyright notice from the actual binary:
+Copyright 1998-2026 The OpenSSL Authors. All rights reserved.
+
+Exact upstream source tag: openssl-3.5.9
+Upstream license file:
+https://github.com/openssl/openssl/blob/openssl-3.5.9/LICENSE.txt
+The complete original license text is preserved in OPENSSL_3.5.9_LICENSE.txt.
+
+At this exact source tag, no top-level NOTICE or COPYRIGHT file was found.
+This note preserves the observed component attribution and does not state
+that the entire bundled program's dependency or redistribution review is complete.

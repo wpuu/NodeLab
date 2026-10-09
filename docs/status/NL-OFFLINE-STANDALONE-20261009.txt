@@ -1,0 +1,34 @@
+NodeLab 原生桌面构建候选
+日期：2026-10-09（北京时间）；执行助手：Codex，细分模型未独立核验。
+
+本轮完成原生完整目录构建配方及冻结程序虚构验收。当前离线功能完整：URI/Base64盘点、格式记录、保存报告核对、匿名摘要复制。桌面包目标是自带Python/Tk，用户无需预装Python；Windows必须实际Windows构建，Linux内部验证不替代Windows。
+
+本地离线578通过/18跳过；新增冻结入口28通过、构建契约39通过，与整体重叠不相加。实际Linux冻结二进制双自检通过；源码暂存删除且PATH空，解压后邻近旧源码+PYTHONPATH干扰仍通过，网络系统调用拒绝下同二进制通过，socket创建EPERM负控。Tcl9.0.4实际运行，Linux未运行图形窗口；Tk版本null。冻结状态true且忽略环境true，模块由PyInstaller loader加载。
+初次真实构建因漏收非标准prefix的Tcl9 native两库而自检失败，没有发布完成ZIP；随后显式收集两个固定本地库，未使用LD_LIBRARY_PATH伪通过。完成文件与哈希的失败发布、字段/类型放宽、Tcl/Tk环境继承问题均已修复并独立回归。
+
+构建隔离venv无systemsite，执行-I；PyInstaller6.22.3、hooks2026.8及其依赖和idna3.20固定，共8包/18wheel官方哈希核验。无需安装完整项目的HTTPX/PyYAML。仅固定7个离线NodeLab模块进入PYZ；构建后检查白名单及排除引擎、CLI、测量。
+选择onedir/noUPX；入口用.py后缀console+Windows hide-late，机器验收能可靠读取固定JSON。无stdout或自检失败返回非零；任意自检字段和类型必须完全匹配，不能任意插入私有文本。
+冻结验收真实两种格式、三次报告往返、输入和报告字节/mtime不变、不一致MD拒绝、socket/DNS/Popen负控。未安装guard先在合成审计探针失败，不真的启动子进程或DNS。
+源码版旧路径路由保留；冻结版不插入邻近旧源码。构建环境清Python/Tcl/Tk/LD/DYLD影响，测试PATH置空，构建暂存删除后运行。
+选定Python/idna/Tcl/Tk/PyInstaller运行许可随包复制；实际原生依赖许可完整清单待目标Windows核对，release_ready=false。只证明构建/自检完成，不是发布签名或生产发布。
+
+Github实际分支创建成功：feat/offline-inventory-standalone-20261009，基线fe8c1399af7485aff70ead0015b5ab6dd6441455。代码提交44a68b5e17416496851270fa1cf7df9a484fd161，草稿PR #6：https://github.com/wpuu/NodeLab/pull/6；首轮CI 37909168353失败，Windows构建未执行；不得继续沿用之前403状态。候选目标为既有离线入口分支，不合并main。
+首轮真实CI发现3.12.14是source-only、setup-python没有Windows x64包；改选官方manifest稳定版Python3.13.16，仍配Tcl/Tk8.6.15。Linux源码CI更新3.12.15，本地3.12.14冻结证据保持原身份。Linux源码测试若真实Tcl不受支持则明确要求拒绝；故障注入固定受支持unit fixture，避免提前失败掩盖故障，不能计入原生证明。二轮CI 37910107868：Linux离线582通过18跳过、全回归676通过36跳过，计数重叠不相加。Windows503通过97失败，普通报告在fstat身份比较被拒绝，尚未构建Windows程序。CPython3.13.16 exact tag源码及官方#157671确认Windows path ctime是creation、fd ctime是ChangeTime。跨API改为严格birthtime+dev/ino/size/mtime/attrs；fd及path各自前后仍完整ctime/birthtime比较，没有跳过替换/属性拒绝。第三轮CI 37910878294：Windows614通过1失败；普通报告读取与源码Tk验收已通过，仅一项coherent报告测试夹具使用默认换行写出CRLF。测试夹具改固定LF，产品字节检查不变；第四轮CI 37911322175：Windows614通过1失败；发现已读marker同inode同长度快速写入后，路径birthtime/mtime不足以识别变化。产品新增末轮按原上限stream读回3报告组件，与首次内部SHA256精确匹配，且重开fd完整ctime/identity与首次fd比。原始输入不重读，内部报告hash不输出/保存；仍非原子快照或来源认证。新增metadata冻结+mtime复原下的跨组件篡改回归，禁止睡眠或弱化原测试来过CI。第五轮CI待回读。
+Windows CI固定3.13.16、独立hash安装venv、每步检查退出码，真实Windows二进制须验证隐藏Tk窗口，成功才上传候选。源码Windows假平台测试只证明构建契约，不能算Windows真实验收。
+没有读取用户节点或E盘文件，没有GCP部署、引擎下载或测量。旧/proc六项失败已在兼容Linux完整回归范围无失败，历史Windows通过不能借用。
+
+首个实际成功产物（下文许可补正版已覆盖此产物指针）：
+代码提交b361e7c8a836308c7ad9c172b28ac79e73b8d403，成功CI37912081842；Windows618通过0跳过0失败，Linux离线599通过19跳过、完整回归693通过37跳过，范围重叠不相加。
+实际Windowsx64完整目录包已生成，Python3.13.16/TclTk8.6.15，冻结True且ignore_environment True。--self-check和--acceptance-check均PASS；Windows隐藏Tk窗口PASS，URI/Base64两格式及3报告往返、网络/DNS/子进程负控、输入和报告字节/mtime不变均通过。源码暂存已删除、PATH清空后执行。Windows二进制由Windows runner执行，本地Linux只做下载产物静态检查，不伪称在此处执行Windows。
+下载产物外层GitHub artifact digest匹配，内层ZIP SHA256 a363600baeaa26205ed17a7ac79f6335ec6910e72722f2122a5bdbe12c3833b5；999文件清单/全部SHA/CRC再读回通过。Windowscheckout为CRLF，builder SHA724e8b71cb24d61834525d14312e76c2b68a1acc79899600289ece2fe25ffc84；已与仓库LF源码转CRLF独立匹配，本地Linuxbuilder SHAa28d54d3995acf18993065e082b87394bcf78ffc8c12794ea5ea9c868c1eee06身份分开。
+Linux当前源码CI Tcl8.6.14不受冻结profile支持，源码acceptance按预期匿名拒绝；与本地Tcl9.0.4真冻结程序PASS的证据分开。Linux完整JUnit逐项复核此前/proc六项case全部PASS。
+报告最终内容读回回归覆盖三组件同长度改写、mtime恢复、全部metadata冻结仍拒绝；原跨组件故障测试未弱化且未加sleep。哈希只在进程内部用于一致性，不保存或返回。仍非原子快照或作者/原输入认证。
+草稿PR #6：https://github.com/wpuu/NodeLab/pull/6，base feat/offline-inventory-entry-20261005，未合并main。候选程序可供虚构文件试用，release_ready=false；用户Windows桌面完整验收及原生依赖许可完整核对未完成，不借用历史通过记录。
+
+产物下载复核后补充：实际PE确认OpenSSL3.5.9及zlib1.3.1，此前notice缺口已发现，不仅标记PENDING。按各自精确官方tag补完整LICENSE；OpenSSL无upstream NOTICE，另保留来源清楚的实际PE版权归属说明，不捏造上游NOTICE。重新构建后由新CI/新ZIP覆盖候选指针，完整原生许可审查仍PENDING。
+
+最终交付许可补正版（当前有效）：
+代码79d1064b34eb9429fad070b2a72280bc454504bf，成功CI37913566382；Windows618通过、Linux离线599通过19跳过、Linux完整693通过37跳过，范围重叠。
+实际WindowsZIP SHA256 14c8c8f7f3f838f755164cdd60988573610ee9135e979756cafd11584a5ed1a9，1002文件及CRC、GitHub外层artifact digest均下载再读回通过。
+准确随包补充OpenSSL3.5.9原始完整Apache2许可、实际PE版权归属说明与zlib1.3.1完整原始许可，原始tag Gitblob已校验。Windowscheckout的CRLF与上游LF对比使用换行规范化后全文一致，不假称原始字节相同。新WindowsbuilderSHA8bef509e9adeef292aab507b81f4954141818bd1c8a9711c9f0f6df3949b3fb4与本地LF源码转CRLF完全匹配。
+实际冻结双自检、隐藏Tk、虚构输入/报告往返与网络/DNS/子进程负控再通过；最新产物与最早Linux源码拒绝profile/过去成功产物的证据保持分开。完整原生依赖许可复核仍PENDING、release_ready=false，用户Windows本机桌面验收仍待进行。

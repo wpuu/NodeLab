@@ -9,9 +9,10 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
-from nodelab.inventory import MAX_INPUT_BYTES, InventoryInputError, build_inventory, render_inventory_report
+from nodelab.inventory import MAX_INPUT_BYTES, InventoryInputError, build_inventory, build_input_metadata, render_inventory_report
+from nodelab.subscription_input import decode_subscription_input
 
-_CODES = frozenset({"INPUT_UNSAFE", "INPUT_TOO_LARGE", "OUTPUT_UNSAFE", "OUTPUT_FAILED", "INVENTORY_FAILED"})
+_CODES = frozenset({"INPUT_UNSAFE", "INPUT_TOO_LARGE", "OUTPUT_UNSAFE", "OUTPUT_FAILED", "INVENTORY_FAILED", "INVALID_BASE64", "INVALID_ARGUMENTS"})
 
 
 class OfflineFileError(ValueError):
@@ -57,9 +58,11 @@ def _check_local_path(path: Path, *, output: bool = False) -> None:
             raise OfflineFileError(code)
 
 
-def inspect_file(source: Path) -> dict:
+def inspect_file(source: Path, *, input_format: str = "uri_lines") -> dict:
     """Read at most limit+1; raw input stays in process memory."""
     try:
+        if type(input_format) is not str or input_format not in {"uri_lines", "base64"}:
+            raise OfflineFileError("INVALID_ARGUMENTS")
         _check_local_path(source)
         before = source.lstat()
         if not stat.S_ISREG(before.st_mode):
@@ -75,25 +78,36 @@ def inspect_file(source: Path) -> dict:
             data = handle.read(MAX_INPUT_BYTES + 1)
         if len(data) > MAX_INPUT_BYTES:
             raise OfflineFileError("INPUT_TOO_LARGE")
-        return build_inventory(data)
+        return build_inventory(decode_subscription_input(data, input_format=input_format))
     except OfflineFileError:
         raise
-    except InventoryInputError:
-        raise OfflineFileError("INVENTORY_FAILED") from None
+    except InventoryInputError as exc:
+        code = exc.code if exc.code in {"INPUT_TOO_LARGE", "INVALID_BASE64", "INVALID_ARGUMENTS"} else "INVENTORY_FAILED"
+        raise OfflineFileError(code) from None
     except (OSError, ValueError):
         raise OfflineFileError("INPUT_UNSAFE") from None
     except Exception:
         raise OfflineFileError("INVENTORY_FAILED") from None
 
 
-def save_reports(report: dict, destination: Path) -> Path:
+def save_reports(report: dict, destination: Path, *, input_format: str = "not_recorded") -> Path:
     """All serialized contents are validated before any file is written."""
     try:
-        markdown = render_inventory_report(report)
+        metadata = build_input_metadata(input_format)
+        markdown = render_inventory_report(report, input_format=input_format)
         contents = {
             "inventory.json": json.dumps(report, ensure_ascii=False, indent=2) + "\n",
             "inventory.md": markdown,
         }
+        completed = {
+            "status": "COMPLETE", "schema_version": 2, "mode": "offline_file",
+            "network_requests": 0, "engine_started": False,
+            "created_at_utc": datetime.now(timezone.utc).isoformat(),
+            "files": ["inventory.json", "inventory.md"],
+            **metadata,
+        }
+        # Reject nonserializable metadata before touching any destination.
+        json.dumps(completed, ensure_ascii=False)
         _check_local_path(destination, output=True)
         destination.mkdir(parents=True, exist_ok=True)
         _check_local_path(destination, output=True)
@@ -104,12 +118,6 @@ def save_reports(report: dict, destination: Path) -> Path:
         for name, text in contents.items():
             with (folder / name).open("x", encoding="utf-8", newline="\n") as handle:
                 handle.write(text)
-        completed = {
-            "status": "COMPLETE", "schema_version": 1, "mode": "offline_file",
-            "network_requests": 0, "engine_started": False,
-            "created_at_utc": datetime.now(timezone.utc).isoformat(),
-            "files": ["inventory.json", "inventory.md"],
-        }
         # Publish a marker only after its entire contents reach the file.
         temporary = folder / ".complete.tmp"
         with temporary.open("x", encoding="utf-8", newline="\n") as handle:
@@ -121,10 +129,12 @@ def save_reports(report: dict, destination: Path) -> Path:
         return folder
     except OfflineFileError:
         raise
+    except InventoryInputError as exc:
+        raise OfflineFileError("INVALID_ARGUMENTS" if exc.code == "INVALID_ARGUMENTS" else "OUTPUT_FAILED") from None
     except Exception:
         raise OfflineFileError("OUTPUT_FAILED") from None
 
 
-def run_file(source: Path, destination: Path) -> tuple[dict, Path]:
-    report = inspect_file(source)
-    return report, save_reports(report, destination)
+def run_file(source: Path, destination: Path, *, input_format: str = "uri_lines") -> tuple[dict, Path]:
+    report = inspect_file(source, input_format=input_format)
+    return report, save_reports(report, destination, input_format=input_format)
